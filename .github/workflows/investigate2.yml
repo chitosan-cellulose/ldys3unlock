@@ -1,0 +1,50 @@
+name: Investigate completion + device type
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  investigate2:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Disassemble completion block + connectedDeviceType
+        run: |
+          mkdir -p out
+          # arm64 completion invoke = 0x33e39c ; arm64e = 0x3467b4
+          for arch in arm64 arm64e; do
+            lipo -thin "$arch" bin/SpringBoardService.dylib -o "out/sbs.$arch" 2>/dev/null || cp bin/SpringBoardService.dylib "out/sbs.$arch"
+            otool -ov "out/sbs.$arch" > "out/sbs.$arch.objc" 2>/dev/null
+            otool -tvV "out/sbs.$arch" > "out/sbs.$arch.asm" 2>/dev/null
+            echo "########## SpringBoardService $arch ##########"
+
+            echo "===== [$arch] getExpireStatus COMPLETION BLOCK (invoke) 360 lines ====="
+            if [ "$arch" = arm64 ]; then CB=33e39c; else CB=3467b4; fi
+            grep -A360 -m1 "$CB	" "out/sbs.$arch.asm" | head -365
+
+            echo "===== [$arch] connectedDeviceType IMP + disasm ====="
+            awk '$1=="name" && $NF=="connectedDeviceType" {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc"
+            imp=$(awk '$1=="name" && $NF=="connectedDeviceType" {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc")
+            hx=${imp#0x}
+            echo "connectedDeviceType imp=$imp"
+            [ -n "$hx" ] && grep -A40 -m1 "$hx	" "out/sbs.$arch.asm" | head -44
+
+            echo "===== [$arch] connectedDevice IMP + disasm ====="
+            awk '$1=="name" && $NF=="connectedDevice" {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc"
+            imp2=$(awk '$1=="name" && $NF=="connectedDevice" {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc")
+            hx2=${imp2#0x}
+            echo "connectedDevice imp=$imp2"
+            [ -n "$hx2" ] && grep -A40 -m1 "$hx2	" "out/sbs.$arch.asm" | head -44
+
+            echo "===== [$arch] disasm refs to hardwareConnected / hardwareDisconnected / connectedDeviceType ====="
+            grep -nE "hardwareConnected|hardwareDisconnected|0x50572a|0x5158cd|connectedDeviceType" "out/sbs.$arch.asm" | head -40
+          done
+          ls -l out
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate2
+          path: out/
+          if-no-files-found: error
