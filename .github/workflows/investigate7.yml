@@ -1,0 +1,71 @@
+name: Resolve __cfstring -> code xrefs for activation strings (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve CFStrings and find code xrefs
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output a64
+          lipo -thin arm64e "$F" -output a64e
+          otool -tV a64  > a64.asm
+          otool -tV a64e > a64e.asm
+          python3 - <<'PY'
+          import struct,re
+          TARGETS={
+            "a64":{0x5718fc:"未连接",0x571a10:"充值失败",0x571a26:"充值成功",0x571a5c:"设备",
+                   0x571bee:"未连接",0x572c4e:"绑定",0x572d20:"绑定",0x574b90:"设备",0x574d28:"绑定",0x574e92:"设备"},
+            "a64e":{0x5818ec:"未连接",0x581a00:"充值失败",0x581a16:"充值成功",0x581a4c:"设备",
+                    0x581bde:"未连接",0x582c3e:"绑定",0x582d10:"绑定",0x584b80:"设备",0x584d18:"绑定",0x584e82:"设备"},
+          }
+          for arch,tg in TARGETS.items():
+              blob=open(arch,"rb").read()
+              lines=open(arch+".asm",encoding="utf-8",errors="replace").read().splitlines()
+              print(f"\n################ {arch} ################")
+              # 1) for each cstring VM, find CFString whose strptr == cstring VM (CFString: isa,flags,strptr,len)
+              cf={}  # cfstring_base -> name
+              for vm,name in tg.items():
+                  pat=struct.pack("<Q",vm)
+                  i=blob.find(pat)
+                  while i>=0:
+                      # strptr is at offset +16 of cfstring base; base must be 8-aligned
+                      if (i-16)%8==0:
+                          base=i-16
+                          cf[base]=cf.get(base,name)
+                      i=blob.find(pat,i+8)
+              print(f"cfstrings found: { {hex(k):v for k,v in sorted(cf.items())} }")
+              # 2) grep asm for references to each cfstring base (otool annotates '; 0x<base>')
+              for base,name in sorted(cf.items()):
+                  pat=f"0x{base:x}"
+                  hits=[i for i,ln in enumerate(lines) if pat in ln]
+                  print(f"\n  CFString 0x{base:x} [{name}] refs={len(hits)}")
+                  for i in hits[:8]:
+                      m=re.match(r'\s*([0-9a-f]+)',lines[i]); refa=int(m.group(1),16) if m else 0
+                      # enclosing func start
+                      fn_start=None
+                      for j in range(i,max(0,i-600),-1):
+                          t=lines[j]
+                          if re.match(r'\s*[0-9a-f]+\s',t) and re.search(r'\b(stp|pacibsp|sub\s+sp,\s*sp)\b',t):
+                              fn_start=int(re.match(r'\s*([0-9a-f]+)',t).group(1),16); break
+                      fs=f"0x{fn_start:x}" if fn_start else "?"
+                      print(f"    ref@0x{refa:x} func~{fs}")
+                      for k in range(max(0,i-10),min(len(lines),i+4)):
+                          mm=re.match(r'\s*([0-9a-f]+)',lines[k])
+                          if mm: print("        | "+lines[k])
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate7
+          path: |
+            a64.asm
+            a64e.asm
