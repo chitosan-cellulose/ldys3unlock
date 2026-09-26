@@ -16,16 +16,22 @@
 // ---------------------------------------------------------------------------
 static void LDMarkLoaded(const char *tag) {
     @autoreleasepool {
-        NSString *path = @"/var/mobile/Library/ldys3_unlock_loaded.txt";
         NSString *proc = [[NSProcessInfo processInfo] processName];
         NSString *line = [NSString stringWithFormat:@"%@ | %s | %@\n",
                           [NSDate date], tag, proc];
         NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-        } else {
-            [data writeToFile:path atomically:YES];
+        // 写到多个位置，确保至少有一个成功（用于确认 %ctor 真的执行了）
+        NSArray *paths = @[@"/tmp/ldys3_unlock_loaded.txt",
+                           @"/var/mobile/Library/ldys3_unlock_loaded.txt"];
+        for (NSString *path in paths) {
+            @try {
+                if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                    if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+                } else {
+                    [data writeToFile:path atomically:YES];
+                }
+            } @catch (NSException *e) {}
         }
     }
 }
