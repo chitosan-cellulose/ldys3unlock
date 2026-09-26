@@ -24,6 +24,11 @@ jobs:
             echo "=== $base : objc methods (activation/expire/serial/verify/login/deposit) ===" ; otool -ov "out/$base.arm64e" 2>/dev/null > "out/$base.arm64e.objc" ; grep -B3 -A8 -iE "getActivationCode|replyActivationCode|setActivationCode|activationCode|getExpireStatus|expireTime|expire_time|newExpireTime|serialNumber|SerialNumber|verifyKey|internalVerifyKey|_verifyKey|deposit|loginToken|loggedIn|getbp|getDeviceSerial" "out/$base.arm64e.objc" | head -400
             echo "=== $base : disasm (functions) ===" ; otool -tvV "out/$base.arm64e" > "out/$base.arm64e.asm" 2>/dev/null
             wc -l "out/$base.arm64e.asm"
+            if [ "$base" = "ldysdaemon" ]; then
+              echo "=== $base : FULL objc (otool -ov) ===" ; cat "out/$base.arm64e.objc"
+              echo "=== $base : cstring (with addresses) ===" ; otool -v -s __TEXT __cstring "out/$base.arm64e" 2>/dev/null | head -200
+              echo "=== $base : disasm refs to 116 / reply / activation ===" ; grep -nE "116|reply|ctivat|serial|Serial" "out/$base.arm64e.asm" | head -80
+            fi
           done
           ls -l out
       - name: Upload analysis
