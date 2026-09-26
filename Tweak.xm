@@ -1,159 +1,135 @@
-// ldys3_unlock v2 - 绕过佳影游戏厅3(com.zjx.ldys3)服务器验证
-// 策略：运行时按 selector 定位账户相关类（类名混淆，故动态发现），
-//       贪婪枚举其方法，把登录/过期/激活相关的“读”恒返回已激活、“写”强制写远未来。
-// 健壮性：带重试（解决 dylib 加载顺序早于目标类注册的问题）；
-//         任意进程注入都尝试，找不到类就静默跳过。
+// ldys3_unlock v3 - 纯 Objective-C，无 substrate 依赖（保证可加载）
+// 双重绕过：
+//   1) 强制账户本地状态：login=YES / expireTime=2099 / isExpired=NO
+//   2) 跳过服务器验证：拦截发往验证服务器的请求，直接本地返回“成功+永不过期”
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <substrate.h>
 
-#define kFutureTime 4070908800LL   // ~2099
-#define kFutureStr  @"2099-12-31 23:59:59"
+#define kFuture 4070908800LL
+#define kFutureStr @"2099-12-31 23:59:59"
 
-// ---------------------------------------------------------------------------
-// 标记文件：确认 dylib 被加载并跑起来了（用户可 ls 查看）
-// ---------------------------------------------------------------------------
-static void LDMarkLoaded(const char *tag) {
+#pragma mark - 加载标记（确认 %ctor 执行）
+static void MarkLoaded(const char *tag) {
     @autoreleasepool {
         NSString *proc = [[NSProcessInfo processInfo] processName];
-        NSString *line = [NSString stringWithFormat:@"%@ | %s | %@\n",
-                          [NSDate date], tag, proc];
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        // 写到多个位置，确保至少有一个成功（用于确认 %ctor 真的执行了）
-        NSArray *paths = @[@"/tmp/ldys3_unlock_loaded.txt",
-                           @"/var/mobile/Library/ldys3_unlock_loaded.txt"];
-        for (NSString *path in paths) {
+        NSString *line = [NSString stringWithFormat:@"%@ | %s | %@\n", [NSDate date], tag, proc];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        for (NSString *p in @[@"/tmp/ldys3_unlock_loaded.txt", @"/var/mobile/Library/ldys3_unlock_loaded.txt"]) {
             @try {
-                if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-                    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-                    if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-                } else {
-                    [data writeToFile:path atomically:YES];
-                }
+                if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+                    if (fh) { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+                } else { [d writeToFile:p atomically:YES]; }
             } @catch (NSException *e) {}
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// 找到所有“实现了指定 selector”的类
-// ---------------------------------------------------------------------------
-static NSArray *LDClassesWithSelector(SEL sel) {
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
+#pragma mark - 工具：找实现某 selector 的所有类
+static NSArray *ClassesWithSel(SEL s) {
+    unsigned int n = 0; Class *cs = objc_copyClassList(&n);
     NSMutableArray *out = [NSMutableArray array];
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        if (class_getInstanceMethod(c, sel) || class_getClassMethod(c, sel)) {
-            [out addObject:c];
-        }
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = cs[i];
+        if (class_getInstanceMethod(c, s) || class_getClassMethod(c, s)) [out addObject:c];
     }
-    if (classes) free(classes);
+    if (cs) free(cs);
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// 对单个类贪婪 hook：枚举方法，按名称语义强制返回值
-// ---------------------------------------------------------------------------
-static void LDHookOneClass(Class cls) {
-    unsigned int mc = 0;
-    Method *methods = class_copyMethodList(cls, &mc);
+#pragma mark - 1) 强制账户本地状态（贪婪枚举方法）
+static void HookAccountClass(Class cls) {
+    unsigned int mc = 0; Method *ms = class_copyMethodList(cls, &mc);
     for (unsigned int i = 0; i < mc; i++) {
-        SEL sel = method_getName(methods[i]);
-        NSString *name = NSStringFromSelector(sel);
+        NSString *name = NSStringFromSelector(method_getName(ms[i]));
         if (!name) continue;
-
-        // —— 读：恒“已激活/永不过期” ——
         if ([name isEqualToString:@"login"] || [name isEqualToString:@"loggedIn"] ||
-            [name isEqualToString:@"isLogin"] || [name containsString:@"isValid"] ||
-            [name containsString:@"isActivated"]) {
-            IMP y = imp_implementationWithBlock(^BOOL(id slf){ return YES; });
-            method_setImplementation(methods[i], y);
-            NSLog(@"[ldys3_unlock] %@ -> YES", name);
-        }
-        else if ([name containsString:@"isExpired"] || [name isEqualToString:@"expired"] ||
-                 [name containsString:@"isOverdue"]) {
-            IMP n = imp_implementationWithBlock(^BOOL(id slf){ return NO; });
-            method_setImplementation(methods[i], n);
-            NSLog(@"[ldys3_unlock] %@ -> NO", name);
-        }
-        else if ([name isEqualToString:@"expireTime"]) {
-            IMP f = imp_implementationWithBlock(^long long(id slf){ return kFutureTime; });
-            method_setImplementation(methods[i], f);
-            NSLog(@"[ldys3_unlock] expireTime -> 2099");
-        }
-        else if ([name isEqualToString:@"expireTimeString"]) {
-            IMP s = imp_implementationWithBlock(^id(id slf){ return kFutureStr; });
-            method_setImplementation(methods[i], s);
-        }
-        else if ([name isEqualToString:@"getActivationCode"] || [name isEqualToString:@"activationCode"]) {
-            IMP s = imp_implementationWithBlock(^id(id slf){ return @"ACTIVATED"; });
-            method_setImplementation(methods[i], s);
-        }
-        // —— 写：强制写远未来 / YES ——
-        else if ([name isEqualToString:@"setLogin:"]) {
-            IMP s = imp_implementationWithBlock(^(id slf, BOOL v){ /* force YES */ });
-            method_setImplementation(methods[i], s);
-        }
-        else if ([name isEqualToString:@"setExpireTime:"]) {
-            IMP s = imp_implementationWithBlock(^(id slf, long long v){ /* force future */ });
-            method_setImplementation(methods[i], s);
-        }
-        else if ([name isEqualToString:@"setExpireTimeString:"]) {
-            IMP s = imp_implementationWithBlock(^(id slf, id v){ });
-            method_setImplementation(methods[i], s);
-        }
-        else if ([name isEqualToString:@"setActivationCode:"]) {
-            IMP s = imp_implementationWithBlock(^(id slf, id v){ });
-            method_setImplementation(methods[i], s);
+            [name containsString:@"isValid"] || [name containsString:@"isActivated"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^BOOL(id s){ return YES; }));
+        } else if ([name containsString:@"isExpired"] || [name isEqualToString:@"expired"] ||
+                   [name containsString:@"isOverdue"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^BOOL(id s){ return NO; }));
+        } else if ([name isEqualToString:@"expireTime"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^long long(id s){ return kFuture; }));
+        } else if ([name isEqualToString:@"expireTimeString"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^id(id s){ return kFutureStr; }));
+        } else if ([name isEqualToString:@"activationCode"] || [name isEqualToString:@"getActivationCode"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^id(id s){ return @"ACTIVATED"; }));
+        } else if ([name isEqualToString:@"setLogin:"] || [name isEqualToString:@"setExpireTime:"] ||
+                   [name isEqualToString:@"setExpireTimeString:"] || [name isEqualToString:@"setActivationCode:"]) {
+            method_setImplementation(ms[i], imp_implementationWithBlock(^(id s, id v){}));
         }
     }
-    if (methods) free(methods);
+    if (ms) free(ms);
 }
 
-// 触发一次：找出所有账户相关类并 hook；返回是否至少命中一个类
-static BOOL LDTryHookAll(void) {
+static BOOL TryHookAll(void) {
     NSMutableSet *seen = [NSMutableSet set];
-    NSMutableArray *targets = [NSMutableArray array];
-    NSArray *sels = @[
-        NSStringFromSelector(@selector(getExpireStatusWithCompletionHandler:)),
-        NSStringFromSelector(@selector(expireTime)),
-        NSStringFromSelector(@selector(login)),
-        NSStringFromSelector(@selector(replyActivationCode)),
-    ];
+    NSArray *sels = @[@"getExpireStatusWithCompletionHandler:", @"expireTime", @"login", @"replyActivationCode"];
+    BOOL any = NO;
     for (NSString *sn in sels) {
-        for (Class c in LDClassesWithSelector(NSSelectorFromString(sn))) {
-            if (c && ![seen containsObject:c]) { [seen addObject:c]; [targets addObject:c]; }
+        for (Class c in ClassesWithSel(NSSelectorFromString(sn))) {
+            if (c && ![seen containsObject:c]) {
+                [seen addObject:c]; any = YES;
+                NSLog(@"[ldys3_unlock] hooking %@", NSStringFromClass(c));
+                HookAccountClass(c);
+            }
         }
     }
-    if (targets.count == 0) return NO;
-    for (Class c in targets) {
-        NSLog(@"[ldys3_unlock] hooking class: %@", NSStringFromClass(c));
-        LDHookOneClass(c);
-    }
-    return YES;
+    return any;
 }
 
-// ---------------------------------------------------------------------------
-// 入口：任意进程都尝试；带重试，避免加载顺序导致类未注册
-// ---------------------------------------------------------------------------
-%ctor {
+#pragma mark - 2) 跳过服务器验证：拦截 NSURLSession
+@interface LDFakeTask : NSObject @end
+@implementation LDFakeTask
+- (void)resume {} - (void)cancel {} - (void)suspend {}
+@end
+
+static NSURLSessionDataTask *(*orig_dtwrc)(id, SEL, NSURLRequest *, id);
+static NSURLSessionDataTask *new_dtwrc(id self, SEL _cmd, NSURLRequest *req, id handler) {
     @autoreleasepool {
-        LDMarkLoaded("ctor");
-        // 立刻试一次
-        if (LDTryHookAll()) {
-            LDMarkLoaded("hooked-imm");
-            return;
+        NSURL *u = [req URL];
+        NSString *host = [[u host] lowercaseString];
+        NSString *path = [[u path] lowercaseString];
+        BOOL verify = ([host containsString:@"jyyxt"] || [host isEqualToString:@"116.62.39.79"] || [host isEqualToString:@"api.jyyxt.vip"]) &&
+                      ([path containsString:@"login"] || [path containsString:@"deposit"] || [path containsString:@"activ"] ||
+                       [path containsString:@"expire"] || [path containsString:@"verify"] || [path containsString:@"/f"] || [path length] == 0);
+        if (verify && handler) {
+            NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:u statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":@"application/json"}];
+            NSData *data = [@"{\"code\":0,\"success\":true,\"expire_time\":4070908800,\"newExpireTime\":4070908800,\"login_token\":\"ldys3_unlock\",\"userType\":\"vip\"}" dataUsingEncoding:NSUTF8StringEncoding];
+            NSLog(@"[ldys3_unlock] intercepted verify request -> fake success");
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                void (^h)(NSData *, NSURLResponse *, NSError *) = (void (^)(NSData *, NSURLResponse *, NSError *))handler;
+                h(data, resp, nil);
+            });
+            return (NSURLSessionDataTask *)[LDFakeTask new];
         }
-        // 没找到：后台重试最多 ~25 秒
+    }
+    return orig_dtwrc ? orig_dtwrc(self, _cmd, req, handler) : nil;
+}
+
+static void HookNetwork(void) {
+    Class c = objc_getClass("NSURLSession");
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, @selector(dataTaskWithRequest:completionHandler:));
+    if (m) {
+        orig_dtwrc = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(m);
+        method_setImplementation(m, (IMP)new_dtwrc);
+        NSLog(@"[ldys3_unlock] network hook installed");
+    }
+}
+
+#pragma mark - 入口
+__attribute__((constructor)) static void ldys3_entry(void) {
+    @autoreleasepool {
+        MarkLoaded("ctor");
+        HookNetwork();                 // 任意进程都装网络拦截
+        if (TryHookAll()) { MarkLoaded("hooked-imm"); return; }
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             for (int i = 0; i < 25; i++) {
                 [NSThread sleepForTimeInterval:1.0];
-                if (LDTryHookAll()) {
-                    LDMarkLoaded("hooked-retry");
-                    break;
-                }
+                if (TryHookAll()) { MarkLoaded("hooked-retry"); break; }
             }
         });
     }
