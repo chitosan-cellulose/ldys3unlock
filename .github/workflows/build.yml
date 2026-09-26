@@ -11,20 +11,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Theos toolchain
-        run: |
-          brew install ldid xz make
-          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+      - name: Install tools
+        run: brew install ldid dpkg
 
-      - name: Build package (RootHide / arm64e)
+      - name: Build dylib (arm64 + arm64e, no substrate)
         run: |
-          make clean || true
-          make package THEOS_PACKAGE_SCHEME=rootless
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -x objective-c -fobjc-arc -shared -O2 \
+            -target arm64-apple-ios14.0 -isysroot "$SDK" \
+            Tweak.xm -o arm64.dylib -framework Foundation
+          xcrun --sdk iphoneos clang -x objective-c -fobjc-arc -shared -O2 \
+            -target arm64e-apple-ios14.0 -isysroot "$SDK" \
+            Tweak.xm -o arm64e.dylib -framework Foundation
+          lipo -create arm64.dylib arm64e.dylib -output ldys3unlock.dylib
+          ldid -S ldys3unlock.dylib
+          echo "--- deps ---"; otool -L ldys3unlock.dylib
+
+      - name: Package deb
+        run: |
+          rm -rf pkg
+          mkdir -p pkg/Library/MobileSubstrate/DynamicLibraries pkg/DEBIAN
+          cp ldys3unlock.dylib pkg/Library/MobileSubstrate/DynamicLibraries/
+          cp ldys3unlock.plist pkg/Library/MobileSubstrate/DynamicLibraries/
+          cp control pkg/DEBIAN/control
+          chmod 0755 pkg/DEBIAN
+          dpkg-deb -b pkg com.zjx.ldys3.unlock.deb
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: ldys3unlock-deb
-          path: packages/*.deb
+          path: "*.deb"
           if-no-files-found: error
+
