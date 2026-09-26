@@ -1,0 +1,63 @@
+name: Dump recharge completion function full logic + raw bytes (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dump func 0x33d1e8 (arm64) and locate arm64e twin
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output a64
+          lipo -thin arm64e "$F" -output a64e
+          otool -tV a64  > a64.asm
+          otool -tV a64e > a64e.asm
+          python3 - <<'PY'
+          import struct,re,subprocess
+          def disasm_range(thin,lo,hi):
+              out=subprocess.run(["otool","-tV",thin],capture_output=True,text=True).stdout.splitlines()
+              res=[]
+              for ln in out:
+                  m=re.match(r'\s*([0-9a-f]{5,})\s',ln)
+                  if m and lo<=int(m.group(1),16)<hi: res.append(ln)
+              return res
+          def rawbytes(thin,lo,hi):
+              b=open(thin,"rb").read(); 
+              return b[lo:hi]
+
+          print("################ ARM64 func 0x33d1e8 disasm ################")
+          for ln in disasm_range("a64",0x33d1e0,0x33d3c0): print(ln)
+          print("\n################ ARM64 raw bytes 0x33d1e0..0x33d3c0 ################")
+          rb=rawbytes("a64",0x33d1e0,0x33d3c0)
+          for o in range(0,len(rb),32):
+              print(f"{0x33d1e0+o:08x}  "+" ".join(f"{x:02x}" for x in rb[o:o+32]))
+
+          # locate arm64e twin: find function referencing both 充值成功&失败 cfstrings.
+          # arm64e cstring base is ~0x10000 higher; cfstring refs in asm text: search for the
+          # selector 'initWithString:type:' calls building a toast right after a 'stringWithFormat:'.
+          print("\n################ ARM64E: scan for recharge-completion twin ################")
+          lines=open("a64e.asm",encoding="utf-8",errors="replace").read().splitlines()
+          # print region around guessed offset 0x345600
+          for ln in disasm_range("a64e",0x345400,0x345900):
+              if any(k in ln for k in ["stringWithFormat","initWithString:type","show","cfstring","b.","cbz","cbnz","cmp","tbnz","b ","ret","blraa","bl "]):
+                  print(ln)
+          # also dump raw bytes there
+          print("\n################ ARM64E raw bytes 0x345400..0x345900 ################")
+          rb=rawbytes("a64e",0x345400,0x345900)
+          for o in range(0,len(rb),32):
+              print(f"{0x345400+o:08x}  "+" ".join(f"{x:02x}" for x in rb[o:o+32]))
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate9
+          path: |
+            a64.asm
+            a64e.asm
