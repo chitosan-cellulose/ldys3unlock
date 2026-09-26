@@ -11,134 +11,150 @@ jobs:
 
       - name: Check binaries present
         run: |
-          set -e
           echo "== bin/ contents =="
           ls -l bin/ 2>/dev/null || echo "NO bin/ folder"
           for f in ldysdaemon BackboardService.dylib SpringBoardService.dylib; do
-            if [ -f "bin/$f" ]; then echo "HAVE bin/$f : $(ls -l bin/$f | awk '{print $5}') bytes"; lipo -info bin/$f 2>/dev/null; else echo "MISSING bin/$f"; fi
+            if [ -f "bin/$f" ]; then
+              echo "HAVE bin/$f : $(ls -l bin/$f | awk '{print $5}') bytes"
+              lipo -info "bin/$f" 2>/dev/null || true
+            else
+              echo "MISSING bin/$f"
+            fi
           done
         shell: bash
 
-      - name: Thin slices + dump strings with offsets
+      - name: Write analysis script
+        run: |
+          cat > analyze.py <<'PYEOF'
+          import struct, os, re, sys
+
+          def load_slice(path):
+              # try arm64e, then arm64, then whole file
+              base = os.path.basename(path)
+              for arch in ("arm64e", "arm64"):
+                  out = "out/%s.%s" % (base, arch)
+                  if os.path.exists(out):
+                      return open(out, "rb").read(), out
+              return open(path, "rb").read(), path
+
+          def strings_with_offset(blob, minlen=5):
+              res = []
+              cur = bytearray(); start = 0
+              for i, b in enumerate(blob):
+                  if 32 <= b < 127:
+                      if not cur: start = i
+                      cur.append(b)
+                  else:
+                      if len(cur) >= minlen:
+                          res.append((start, cur.decode('ascii', 'replace')))
+                      cur = bytearray()
+              if len(cur) >= minlen:
+                  res.append((start, cur.decode('ascii', 'replace')))
+              return res
+
+          def u32(blob, o):
+              return struct.unpack_from("<I", blob, o)[0]
+
+          def adrp_target(pc, ins):
+              if (ins & 0x9f000000) != 0x90000000:
+                  return None
+              immlo = (ins >> 29) & 3
+              immhi = (ins >> 5) & 0x7ffff
+              imm = (immhi << 2) | immlo
+              if imm & (1 << 20):
+                  imm -= (1 << 21)
+              return (pc & ~0xfff) + (imm << 12)
+
+          def find_xrefs(blob, soff_map):
+              n = len(blob) // 4
+              xrefs = {k: [] for k in soff_map}
+              for i in range(n - 1):
+                  pc = i * 4
+                  t = adrp_target(pc, u32(blob, pc))
+                  if t is None:
+                      continue
+                  rd = u32(blob, pc) & 31
+                  for j in range(i + 1, min(i + 5, n)):
+                      w = u32(blob, j * 4)
+                      if (w & 0xffc00000) == 0x91000000 and (w & 31) == rd and ((w >> 5) & 31) == rd:
+                          addr = t + (((w >> 10) & 0xfff) << (12 if (w >> 22) & 1 else 0))
+                          for sname, soffv in soff_map.items():
+                              if addr == soffv:
+                                  xrefs[sname].append(pc)
+                          break
+              return xrefs
+
+          TARGETS = [b'http://116.62.39.79:1203/f', b'replyActivationCode', b'getActivationCode',
+                     b'setActivationCode', b'pongDaemon', b'replyServerName', b'statusCode']
+          KW = re.compile(r'116\.|/f$|Activation|activation|expire|statusCode|reply|pong|ServerName|xpc|hid|serial|Serial|valid|author|license|connect|device|register|token|login|expired')
+
+          for f in ["ldysdaemon", "BackboardService.dylib"]:
+              path = "bin/%s" % f
+              if not os.path.exists(path):
+                  print("MISSING %s" % f)
+                  continue
+              print("\n########## %s ##########" % f)
+              blob, src = load_slice(path)
+              print("slice src:", src, "size:", len(blob))
+              res = strings_with_offset(blob, 5)
+              with open("out/%s.strings.txt" % f, "w") as o:
+                  for off, s in res:
+                      o.write("0x%x\t%s\n" % (off, s))
+              print("--- interesting strings (offset : string) ---")
+              seen = set()
+              for off, s in res:
+                  if KW.search(s) and s not in seen:
+                      seen.add(s)
+                      print("0x%x\t%s" % (off, s))
+              soff = {}
+              for t in TARGETS:
+                  i = blob.find(t)
+                  if i >= 0:
+                      soff[t.decode()] = i
+              print("\n--- target string offsets ---")
+              for k, v in soff.items():
+                  print("  %r @ 0x%x" % (k, v))
+              xrefs = find_xrefs(blob, soff)
+              print("--- xrefs (code that loads each string) ---")
+              for sname, locs in xrefs.items():
+                  print("  %r : %s" % (sname, [hex(x) for x in locs]))
+              allpc = sorted(set(sum(xrefs.values(), [])))
+              for pc in allpc:
+                  lo = max(0, pc - 0x50)
+                  hi = min(len(blob), pc + 0xf0)
+                  print("\n---- raw bytes 0x%x .. 0x%x (xref at 0x%x) ----" % (lo, hi, pc))
+                  for o in range(lo, hi, 16):
+                      chunk = blob[o:o + 16]
+                      print("0x%06x  %s" % (o, " ".join("%02x" % b for b in chunk)))
+          PYEOF
+          echo "script written, lines: $(wc -l < analyze.py)"
+        shell: bash
+
+      - name: Thin slices and run analysis
         run: |
           set -e
           mkdir -p out
           for f in ldysdaemon BackboardService.dylib; do
-            [ -f "bin/$f" ] || { echo "skip $f (missing)"; continue; }
-            echo "########## $f strings (offset : string) ##########"
-            lipo -thin arm64e "bin/$f" -output "out/${f}.arm64e" 2>/dev/null && echo "arm64e thin ok" || echo "no arm64e slice (single arch?)"
-            python3 - "$f" <<'PY'
-            import sys,re
-            f=sys.argv[1]
-            p="out/%s.arm64e"%f
-            import os
-            if not os.path.exists(p):
-                # try arm64
-                p2="out/%s.arm64"%f
-                os.system("lipo -thin arm64 bin/%s -output %s 2>/dev/null"%(f,p2))
-                p=p2 if os.path.exists(p2) else "bin/%s"%f
-            blob=open(p,"rb").read()
-            # extract ascii strings with file offset (== VM for these, __TEXT vmaddr 0)
-            res=[]; cur=bytearray(); start=0
-            for i,b in enumerate(blob):
-                if 32<=b<127:
-                    if not cur: start=i
-                    cur.append(b)
-                else:
-                    if len(cur)>=5: res.append((start,cur.decode('ascii','replace')))
-                    cur=bytearray()
-            if len(cur)>=5: res.append((start,cur.decode('ascii','replace')))
-            # save all
-            with open("out/%s.strings.txt"%f,"w") as o:
-                for off,s in res: o.write("0x%x\t%s\n"%(off,s))
-            # print interesting hits with offsets
-            kw=re.compile(r'116\.|/f$|Activation|activation|expire|statusCode|reply|pong|ServerName|xpc|hid|serial|Serial|valid|author|license|connect|device|register|token|login|expired')
-            seen=set()
-            for off,s in res:
-                if kw.search(s) and s not in seen:
-                    seen.add(s); print("0x%x\t%s"%(off,s))
-            PY
-          done
-        shell: bash
-
-      - name: otool objc methods for ldysdaemon + BackboardService
-        run: |
-          set -e
-          for f in ldysdaemon BackboardService.dylib; do
             [ -f "bin/$f" ] || continue
-            echo "########## otool -ov $f ##########"
-            otool -ov "bin/$f" 2>/dev/null | grep -iE 'name 0x|reply|pong|activation|expire|server|hid|status|connect|serial|device|set:|get' | head -120 || true
+            lipo -thin arm64e "bin/$f" -output "out/${f}.arm64e" 2>/dev/null && echo "$f arm64e thin ok" || echo "$f no arm64e"
+            lipo -thin arm64 "bin/$f" -output "out/${f}.arm64" 2>/dev/null && echo "$f arm64 thin ok" || echo "$f no arm64"
           done
+          python3 analyze.py
         shell: bash
 
-      - name: Disassemble ldysdaemon around key string xrefs + dump raw bytes
+      - name: otool objc + disasm grep (ldysdaemon)
         run: |
-          set -e
           [ -f bin/ldysdaemon ] || { echo "no ldysdaemon"; exit 0; }
-          python3 - <<'PY'
-          import struct,os,subprocess
-          # pick arm64e slice thin file, else whole binary
-          p="out/ldysdaemon.arm64e"
-          if not os.path.exists(p): p="out/ldysdaemon.arm64"
-          if not os.path.exists(p): p="bin/ldysdaemon"
-          blob=open(p,"rb").read()
-          print("analyzing:",p,"size",len(blob))
-          def u32(o): return struct.unpack_from("<I",blob,o)[0]
-          # strings we care about (substring match) and their offsets
-          targets=[b'http://116.62.39.79:1203/f', b'replyActivationCode', b'getActivationCode', b'setActivationCode', b'pongDaemon', b'replyServerName', b'statusCode']
-          soff={}
-          for t in targets:
-              i=blob.find(t)
-              if i>=0: soff[t.decode()]=i; print("string %r @ 0x%x"%(t,i))
-          # adrp+add xref finder: for each string addr, find code that computes it
-          def adrp_target(pc,ins):
-              if (ins&0x9f000000)!=0x90000000: return None
-              immlo=(ins>>29)&3; immhi=(ins>>5)&0x7ffff; imm=(immhi<<2)|immlo
-              if imm&(1<<20): imm-=(1<<21)
-              return (pc&~0xfff)+(imm<<12)
-          n=len(blob)//4
-          xrefs={t:[] for t in soff}
-          for i in range(n-1):
-              pc=i*4; t=adrp_target(pc,u32(pc))
-              if t is None: continue
-              rd=u32(pc)&31
-              for j in range(i+1,min(i+5,n)):
-                  w=u32(j*4)
-                  if (w&0xffc00000)==0x91000000 and (w&31)==rd and ((w>>5)&31)==rd:
-                      addr=t+(((w>>10)&0xfff)<<(12 if (w>>22)&1 else 0))
-                      for sname,soffv in soff.items():
-                          if addr==soffv: xrefs[sname].append(pc)
-                      break
-          for sname,locs in xrefs.items():
-              print("\n== xrefs to %r: %s =="%(sname,[hex(x) for x in locs]))
-          # disassemble a window around each xref using otool on the thin file
-          allpc=sorted(set(sum(xrefs.values(),[])))
-          if allpc:
-              # build a single big disasm of the relevant region via otool -tV is huge; instead use python capstone? not available. Use otool -p -v on slice.
-              pass
-          # dump raw bytes windows around xrefs (we will disasm with otool separately)
-          for pc in allpc:
-              lo=max(0,pc-0x40); hi=min(len(blob),pc+0xc0)
-              print("\n---- raw bytes around xref 0x%x (0x%x..0x%x) ----"%(pc,lo,hi))
-              for o in range(lo,hi,16):
-                  chunk=blob[o:o+16]
-                  print("0x%06x  %s"%(o," ".join("%02x"%b for b in chunk)))
-          PY
-        shell: bash
-
-      - name: otool disasm windows around ldysdaemon xrefs
-        run: |
-          set -e
-          [ -f bin/ldysdaemon ] || exit 0
-          P="out/ldysdaemon.arm64e"; [ -f "$P" ] || P="out/ldysdaemon.arm64"; [ -f "$P" ] || P="bin/ldysdaemon"
+          P="out/ldysdaemon.arm64e"
+          [ -f "$P" ] || P="out/ldysdaemon.arm64"
+          [ -f "$P" ] || P="bin/ldysdaemon"
           echo "disasm file: $P"
-          # dump the whole __TEXT disasm to a file, then we grep windows in next step via python is hard; just dump targeted ranges by address using otool -tV is full.
-          # Use otool -tV and sed is heavy; instead print full and rely on python raw bytes already shown. We'll otool -p to get labels.
+          echo "== objc methods (otool -ov) =="
+          otool -ov "bin/ldysdaemon" 2>/dev/null | grep -iE 'name 0x|reply|pong|activation|expire|server|hid|status|serial|device' | head -120 || true
+          echo "== full disasm grep =="
           otool -tV "$P" 2>/dev/null > out/ldysdaemon.full.asm || true
           wc -l out/ldysdaemon.full.asm
-          echo "== grep windows =="
-          for a in 0x00003 0x00004 0x00005 0x00006 0x00007 0x00008; do true; done
-          grep -nE '116\.62|replyActivation|getActivation|setActivation|pongDaemon|replyServer|statusCode|NSJSON|dataTask|completionHandler|b\.ne|cbz|cbnz|cmp ' out/ldysdaemon.full.asm | head -150 || true
+          grep -nE '116\.62|replyActivation|getActivation|setActivation|pongDaemon|replyServer|statusCode|NSJSON|dataTask|completionHandler|b\.(ne|eq|lt|gt|le|ge|hs|lo|hi)|cbz|cbnz|cmp ' out/ldysdaemon.full.asm | head -200 || true
         shell: bash
 
       - name: Upload artifacts
