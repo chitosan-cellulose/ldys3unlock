@@ -1,0 +1,113 @@
+name: Find activation/recharge strings and their code xrefs (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate activation-related strings & decode xrefs from raw bytes
+        run: |
+          set -e
+          python3 - <<'PY'
+          import struct, re
+          F="bin/SpringBoardService.dylib"
+          data=open(F,"rb").read()
+          # slices
+          import subprocess
+          # split fat
+          def fat_offsets(data):
+              magic=struct.unpack_from(">I",data,0)[0]
+              assert magic in (0xcafebabe,0xbebafeca)
+              nfat=struct.unpack_from(">I",data,4)[0]
+              off=8; res={}
+              for _ in range(nfat):
+                  cputype,cpusubtype,offset,size,align=struct.unpack_from(">IIIII",data,off); off+=20
+                  res["arm64e" if cpusubtype==2 else "arm64"]=(offset,size)
+              return res
+          slices=fat_offsets(data)
+          print("fat slices:",{k:(hex(v[0]),hex(v[1])) for k,v in slices.items()})
+
+          KWS=["充值失败","充值成功","激活","未激活","已激活","已到期","未连接","已连接","当前设备","卡密","兑换","续费","到期","设备","绑定","激活码","验证失败","验证成功"]
+          def find_utf16(blob,s):
+              pat=s.encode("utf-16-le"); out=[]
+              i=blob.find(pat)
+              while i>=0:
+                  out.append(i); i=blob.find(pat,i+2)
+              return out
+
+          for arch,(base,size) in slices.items():
+              blob=data[base:base+size]
+              print(f"\n############ {arch} base={hex(base)} ############")
+              hits={}
+              for kw in KWS:
+                  offs=find_utf16(blob,kw)
+                  for o in offs:
+                      hits.setdefault(o,set()).add(kw)
+              # also UTF8
+              for kw in KWS:
+                  pat=kw.encode("utf-8"); i=blob.find(pat)
+                  while i>=0:
+                      hits.setdefault(i,set()).add(kw+"(utf8)"); i=blob.find(pat,i+1)
+              # print sorted string offsets
+              print(f"-- string hits ({len(hits)}) --")
+              for o in sorted(hits):
+                  print(f"  VM 0x{o:x}  {sorted(hits[o])}")
+
+              # decode adrp+add xrefs scanning all instructions
+              def u32(blob,o): return struct.unpack_from("<I",blob,o)[0]
+              # adrp: bits31=op, 0x90000000 mask; immlo=bits29-30, immhi=bits5-23
+              # compute adrp target: PC&~0xfff + SignExtend(immhi:immlo<<12)
+              def adrp_target(pc,insn):
+                  if (insn & 0x9f000000)!=0x90000000: return None
+                  immlo=(insn>>29)&3
+                  immhi=(insn>>5)&0x7ffff
+                  imm=immhi<<2 | immlo
+                  if imm & (1<<20): imm-=(1<<21)
+                  return (pc & ~0xfff)+(imm<<12)
+              xrefs={}
+              n=len(blob)//4
+              for i in range(n-1):
+                  pc=i*4
+                  ins=u32(blob,pc)
+                  t=adrp_target(pc,ins)
+                  if t is None: continue
+                  rd=ins&31
+                  # look ahead up to 4 for add reg,reg,#imm12 (and ldr with imm)
+                  for j in range(i+1,min(i+5,n)):
+                      ins2=u32(blob,j*4)
+                      # add xd,xn,#imm : 0x91000000 mask 0xffc00000
+                      if (ins2 & 0xffc00000)==0x91000000 and (ins2&31)==rd and ((ins2>>5)&31)==rd:
+                          imm12=(ins2>>10)&0xfff
+                          sh=(ins2>>22)&1
+                          addv=imm12<<(12 if sh else 0)
+                          addr=t+addv
+                          if addr in hits:
+                              xrefs.setdefault(addr,[]).append(pc)
+                          break
+                      # ldr xd,[xn,#imm] form: 0xf9400000 (64) ; but string refs usually add
+              print(f"-- xrefs (adrp+add) to those strings --")
+              for o in sorted(hits):
+                  if o in xrefs:
+                      print(f"  VM 0x{o:x} {sorted(hits[o])}  <- refs at {[hex(x) for x in xrefs[o]]}")
+          PY
+        shell: bash
+
+      - name: Disasm arm64e around the recharge xrefs
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64e "$F" -output t64e
+          otool -tV t64e > t64e.asm
+          echo "saved"
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate5
+          path: |
+            t64e.asm
