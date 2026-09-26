@@ -23,6 +23,7 @@ jobs:
           # original getter instructions (verified against runtime disasm):
           LDRB_RET = bytes.fromhex("00404039") + RET   # ldrb w0,[x0,#0x10] ; ret
           LDR_RET  = bytes.fromhex("001040f9") + RET   # ldr  x0,[x0,#0x20] ; ret
+          LDRW_RET = bytes.fromhex("000c4071") + RET   # ldr  w0,[x0,#0xc]  ; ret  (connectedDeviceType)
           # replacements:
           MOV1_RET = bytes.fromhex("20008052") + RET   # mov w0,#1 ; ret
           FAR_RET  = bytes.fromhex("a054bed2") + RET   # movz x0,#0xF2A5,lsl#16 ; ret  (~year 2099)
@@ -32,11 +33,13 @@ jobs:
               (0x347894, LDRB_RET, MOV1_RET),  # login
               (0x3cf300, LDRB_RET, MOV1_RET),  # loggedIn
               (0x3cf310, LDR_RET,  FAR_RET),   # expireTime
+              (0x33fe20, LDRW_RET, MOV1_RET),  # connectedDeviceType -> always connected (1)
             ],
             "arm64": [
               (0x33f3f0, LDRB_RET, MOV1_RET),  # login
               (0x3c3554, LDRB_RET, MOV1_RET),  # loggedIn
               (0x3c3564, LDR_RET,  FAR_RET),   # expireTime
+              (0x337d0c, LDRW_RET, MOV1_RET),  # connectedDeviceType -> always connected (1)
             ],
           }
 
