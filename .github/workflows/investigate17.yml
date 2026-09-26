@@ -1,0 +1,105 @@
+name: Resolve selectors + full disasm ldysdaemon & BackboardService
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Thin + dump otool -ov (selector/cfstring/class resolution)
+        run: |
+          set -e
+          mkdir -p out
+          for b in ldysdaemon BackboardService.dylib; do
+            for a in arm64e arm64; do
+              lipo -thin $a bin/$b -output out/$b.$a 2>/dev/null || true
+            done
+          done
+          echo "############## otool -ov ldysdaemon arm64e ##############"
+          otool -ov out/ldysdaemon.arm64e 2>/dev/null | sed -n '1,200p'
+          echo
+          echo "############## otool -ov ldysdaemon arm64 ##############"
+          otool -ov out/ldysdaemon.arm64 2>/dev/null | sed -n '1,120p'
+        shell: bash
+
+      - name: Python resolve all selrefs/classrefs/cfstrings (read mach-o sections)
+        run: |
+          cat > res.py <<'PYEOF'
+          import struct, os
+          def read_sections(path):
+              d=open(path,'rb').read()
+              # parse mach-o 64
+              magic=struct.unpack_from("<I",d,0)[0]
+              off=0x20  # mach_header_64 size
+              ncmds=struct.unpack_from("<I",d,16)[0]
+              sects={}
+              for _ in range(ncmds):
+                  cmd,sz=struct.unpack_from("<II",d,off)
+                  if cmd==0x19:  # LC_SEGMENT_64
+                      segname=d[off+8:off+24].split(b'\0')[0].decode()
+                      nsects=struct.unpack_from("<I",d,off+64)[0]
+                      so=off+72
+                      for _ in range(nsects):
+                          sname=d[so:so+16].split(b'\0')[0].decode()
+                          addr,size,foff=struct.unpack_from("<III",d,so+32)  # note: addr/offset 64 actually
+                          addr=struct.unpack_from("<Q",d,so+32)[0]
+                          size=struct.unpack_from("<Q",d,so+40)[0]
+                          foff=struct.unpack_from("<I",d,so+48)[0]
+                          sects[sname]=(addr,size,foff)
+                          so+=80
+                  off+=sz
+              return d,sects
+          def cstr(d,off,sz):
+              e=d.find(b'\0',off)
+              return d[off:(e if 0<=e<off+sz else off+sz)].decode('utf-8','replace')
+          for b in ["ldysdaemon"]:
+            for a in ["arm64e","arm64"]:
+              p="out/%s.%s"%(b,a)
+              if not os.path.exists(p): continue
+              d,sects=read_sections(p)
+              print("\n===== %s %s sections ====="%(b,a))
+              for k,v in sects.items(): print("  %-20s addr=0x%x size=0x%x foff=0x%x"%(k,v[0],v[1],v[2]))
+              # resolve selrefs: each 8-byte entry -> decode chained ptr, then read cstring
+              base=sects.get("__objc_selrefs")
+              meth=sects.get("__objc_methname")
+              if base and meth:
+                  a0,asize,afoff=base; m0,msz,mfoff=meth
+                  print("\n  -- selrefs (slot_foff -> selector) --")
+                  for i in range(0,asize,8):
+                      raw=struct.unpack_from("<Q",d,afoff+i)[0]
+                      target=raw & 0xFFFFFFFFF   # low 36 bits = image offset
+                      txt=""
+                      if 0<=target<len(d):
+                          e=d.find(b'\0',target); txt=d[target:e if e>0 else target+40].decode('utf-8','replace')
+                      print("    0x%05x: raw=0x%016x target=0x%x %r"%(a0+i,raw,target,txt))
+              cf=sects.get("__cfstring")
+              cs=sects.get("__cstring")
+              if cf and cs:
+                  c0,csz,cfoff=cf; s0,ssz,soff2=cs
+                  print("\n  -- cfstring (struct_foff -> cstring text) --")
+                  for i in range(0,csz,32):
+                      # cfstring: isa(8) flags(8) strptr(8) len(8); strptr is chained
+                      strptr=struct.unpack_from("<Q",d,cfoff+i+16)[0]
+                      target=strptr & 0xFFFFFFFFF
+                      txt=""
+                      if 0<=target<len(d):
+                          e=d.find(b'\0',target); txt=d[target:e if e>0 else target+60].decode('utf-8','replace')
+                      if txt.strip(): print("    cf@0x%05x -> 0x%x %r"%(c0+i,target,txt))
+          PYEOF
+          python3 res.py
+        shell: bash
+
+      - name: Full disasm ldysdaemon arm64e (otool -tV)
+        run: |
+          echo "######## FULL otool -tV ldysdaemon arm64e ########"
+          otool -tV out/ldysdaemon.arm64e 2>/dev/null
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate17
+          path: out/
