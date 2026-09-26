@@ -1,0 +1,51 @@
+name: Dump gate functions around user-status check (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Full disasm + raw bytes of candidate gate functions (arm64)
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64 "$F" -output a64
+          python3 - <<'PY'
+          import struct,re,subprocess
+          out=subprocess.run(["otool","-tV","a64"],capture_output=True,text=True).stdout.splitlines()
+          def drange(lo,hi):
+              r=[]
+              for ln in out:
+                  m=re.match(r'\s*([0-9a-f]{5,})\s',ln)
+                  if m and lo<=int(m.group(1),16)<hi: r.append(ln)
+              return r
+          blob=open("a64","rb").read()
+          # candidate gate regions (arm64)
+          regs=[(0x336f00,0x337200),(0x3f0400,0x3f0700),(0x477f00,0x478180)]
+          for (lo,hi) in regs:
+              print(f"\n###### disasm {hex(lo)}..{hex(hi)} ######")
+              for ln in drange(lo,hi): print(ln)
+              print(f"\n###### raw bytes {hex(lo)}..{hex(hi)} ######")
+              rb=blob[lo:hi]
+              for o in range(0,len(rb),32):
+                  print(f"{lo+o:08x}  "+" ".join(f"{x:02x}" for x in rb[o:o+32]))
+          # find callers (bl) of the toast func 0x337078 and 0x3f0524
+          print("\n###### callers (bl <target>) ######")
+          for tgt in (0x337078,0x3f0524,0x337010,0x337774):
+              callers=[]
+              for ln in out:
+                  m=re.match(r'\s*([0-9a-f]{5,})\s+bl\s+0x([0-9a-f]+)',ln)
+                  if m and int(m.group(2),16)==tgt: callers.append(int(m.group(1),16))
+              print(f"  bl 0x{tgt:x}: {[hex(c) for c in callers]}")
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate11
+          path: a64
