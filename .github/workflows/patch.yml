@@ -1,0 +1,63 @@
+name: Patch & sign SpringBoardService
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch getters and re-sign
+        run: |
+          set -e
+          mkdir -p out
+          python3 - <<'PY'
+          import struct
+          patches = {
+            "arm64e": [
+              # login -> mov w0,#1 ; ret
+              (0x347894, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
+              # loggedIn -> mov w0,#1 ; ret
+              (0x3cf300, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
+              # expireTime -> movz x0,#0xF2A5,lsl#16 (year ~2099) ; ret
+              (0x3cf310, bytes.fromhex("000840f9c0035fd6"), bytes.fromhex("a054bed2c0035fd6")),
+            ],
+            "arm64": [
+              (0x33f3f0, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
+              (0x3c3554, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
+              (0x3c3564, bytes.fromhex("000840f9c0035fd6"), bytes.fromhex("a054bed2c0035fd6")),
+            ],
+          }
+          for arch, plist in patches.items():
+            src = f"out/sbs.{arch}"
+            import subprocess
+            subprocess.run(["lipo","-thin",arch,"bin/SpringBoardService.dylib","-o",src], check=True)
+            with open(src,"rb") as f: data=bytearray(f.read())
+            for off, exp, rep in plist:
+                cur=bytes(data[off:off+len(exp)])
+                print(f"[{arch}] off=0x{off:x} orig={cur.hex()} expect={exp.hex()} match={cur==exp}")
+                assert cur==exp, f"byte mismatch at 0x{off:x}: {cur.hex()} != {exp.hex()}"
+                data[off:off+len(rep)]=rep
+            with open(src,"wb") as f: f.write(data)
+            print(f"[{arch}] patched {src}")
+          PY
+          # re-sign each thin slice
+          for arch in arm64 arm64e; do
+            ldid -S "out/sbs.$arch"
+            echo "signed out/sbs.$arch"
+          done
+          # rebuild fat binary
+          lipo -create -output out/SpringBoardService.dylib out/sbs.arm64 out/sbs.arm64e
+          ldid -S out/SpringBoardService.dylib
+          file out/SpringBoardService.dylib
+          lipo -info out/SpringBoardService.dylib
+          ls -l out
+      - name: Upload patched binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched
+          path: out/SpringBoardService.dylib
+          if-no-files-found: error
