@@ -21,6 +21,7 @@ jobs:
             lipo -thin arm64e "$f" -o "out/$base.arm64e" 2>/dev/null || cp "$f" "out/$base.arm64e"
             echo "=== $base : load cmds ===" ; otool -l "out/$base.arm64e" | grep -A3 -E "LC_ENCRYPTION|LC_LOAD_DYLIB|LC_ID_DYLIB|name " | head -80
             echo "=== $base : strings (verify related) ===" ; strings -a "out/$base.arm64e" | grep -iE "activ|expire|valid|login|jyyxt|116.62|verify|deposit|serial" | sort -u | head -120
+            echo "=== $base : objc methods (activation/expire/serial/verify/login/deposit) ===" ; otool -ov "out/$base.arm64e" 2>/dev/null > "out/$base.arm64e.objc" ; grep -B3 -A8 -iE "getActivationCode|replyActivationCode|setActivationCode|activationCode|getExpireStatus|expireTime|expire_time|newExpireTime|serialNumber|SerialNumber|verifyKey|internalVerifyKey|_verifyKey|deposit|loginToken|loggedIn|getbp|getDeviceSerial" "out/$base.arm64e.objc" | head -400
             echo "=== $base : disasm (functions) ===" ; otool -tvV "out/$base.arm64e" > "out/$base.arm64e.asm" 2>/dev/null
             wc -l "out/$base.arm64e.asm"
           done
