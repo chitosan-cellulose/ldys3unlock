@@ -12,27 +12,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: Disassemble target methods (both arches)
         run: |
-          set -e
           mkdir -p out
           for arch in arm64 arm64e; do
             lipo -thin "$arch" bin/SpringBoardService.dylib -o "out/sbs.$arch" 2>/dev/null || cp bin/SpringBoardService.dylib "out/sbs.$arch"
             otool -ov "out/sbs.$arch" > "out/sbs.$arch.objc" 2>/dev/null
             otool -tvV "out/sbs.$arch" > "out/sbs.$arch.asm" 2>/dev/null
             echo "########## SpringBoardService $arch ##########"
-            for sel in "getExpireStatusWithCompletionHandler:" "setExpireTimeString:" "expireTimeString" "setActivationCode:" "activationCode" "setLogin:" "login" "setUserType:" "setUsername:"; do
-              imp=$(grep -A1 "name.* ${sel}\$" "out/sbs.$arch.objc" | grep -m1 imp | awk '{print $2}')
-              if [ -z "$imp" ]; then
-                # try match as the whole method name line
-                imp=$(grep -B0 -A1 "name.*${sel}" "out/sbs.$arch.objc" | grep -m1 imp | awk '{print $2}')
-              fi
-              echo "===== $sel  imp=$imp ====="
-              if [ -n "$imp" ]; then
-                grep -A45 "^${imp}	" "out/sbs.$arch.asm" | head -48
-              fi
+            echo "----- raw method blocks (name+imp) -----"
+            grep -B1 -A2 -E "getExpireStatusWithCompletionHandler:| (login|loggedIn|expireTime|expireTimeString|activationCode|setActivationCode:|setLogin:|setExpireTimeString:)\$" "out/sbs.$arch.objc" | head -120
+            echo "----- disasm of each target -----"
+            for sel in "getExpireStatusWithCompletionHandler:" "expireTimeString" "activationCode" "login"; do
+              imp=$(awk -v sel="$sel" '$1=="name" && $NF==sel {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc")
+              hx=${imp#0x}
+              echo "===== [$arch] $sel  imp=$imp ====="
+              [ -n "$hx" ] && grep -A45 -m1 "$hx	" "out/sbs.$arch.asm" | head -48
             done
-            # second class getters: loggedIn / expireTime
-            echo "===== loggedIn / expireTime getters ====="
-            grep -A1 -E "name.* (loggedIn|expireTime)\$" "out/sbs.$arch.objc" | grep imp
+            for sel in "loggedIn" "expireTime"; do
+              imp=$(awk -v sel="$sel" '$1=="name" && $NF==sel {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc")
+              hx=${imp#0x}
+              echo "===== [$arch] $sel  imp=$imp ====="
+              [ -n "$hx" ] && grep -A45 -m1 "$hx	" "out/sbs.$arch.asm" | head -48
+            done
           done
           ls -l out
       - name: Upload
@@ -40,4 +40,4 @@ jobs:
         with:
           name: targets
           path: out/
-          if-no-files-found: error
+          if-no-files-found: error    
