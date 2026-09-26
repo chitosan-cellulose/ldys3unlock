@@ -39,6 +39,9 @@ jobs:
               (0x346828, bytes.fromhex("c1040054"), NOP),  # b.ne (code!=-999 -> fail)  -> nop
               (0x3468d8, bytes.fromhex("e1070054"), NOP),  # b.ne (statusCode!=200)    -> nop
               (0x34698c, bytes.fromhex("f3060034"), NOP),  # cbz w19 (boolValue false) -> nop
+              # --- recharge/activation-code completion: FORCE success + always activate ---
+              (0x3455a8, bytes.fromhex("b30500b4"), bytes.fromhex("2d000014")),  # cbz -> b (always success branch)
+              (0x3456d0, bytes.fromhex("89020054"), NOP),                        # b.ls (expired? return) -> nop
             ],
             "arm64": [
               (0x33f3f0, LDRB_RET, MOV1_RET),  # login
@@ -49,6 +52,9 @@ jobs:
               (0x33e40c, bytes.fromhex("a1040054"), NOP),  # b.ne (code!=-999 -> fail)  -> nop
               (0x33e4b8, bytes.fromhex("81070054"), NOP),  # b.ne (statusCode!=200)    -> nop
               (0x33e564, bytes.fromhex("b3060034"), NOP),  # cbz w19 (boolValue false) -> nop
+              # --- recharge/activation-code completion: FORCE success + always activate ---
+              (0x33d208, bytes.fromhex("b30500b4"), bytes.fromhex("2d000014")),  # cbz -> b (always success branch)
+              (0x33d330, bytes.fromhex("69020054"), NOP),                        # b.ls (expired? return) -> nop
             ],
           }
 
