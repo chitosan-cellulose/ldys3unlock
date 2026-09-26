@@ -1,0 +1,73 @@
+name: Find xrefs to activation strings via otool disasm (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disasm both slices and locate string refs
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output a64
+          lipo -thin arm64e "$F" -output a64e
+          otool -tV a64  > a64.asm
+          otool -tV a64e > a64e.asm
+          wc -l a64.asm a64e.asm
+          python3 - <<'PY'
+          import re
+          # string VMs per slice (from prior run)
+          targets = {
+            "a64.asm": {
+              0x5718fc:"未连接",0x571a10:"充值失败",0x571a26:"充值成功",0x571a5c:"设备",
+              0x571bee:"未连接",0x572c4e:"绑定",0x572d20:"绑定",0x574b90:"设备",0x574d28:"绑定",0x574e92:"设备",
+            },
+            "a64e.asm": {
+              0x5818ec:"未连接",0x581a00:"充值失败",0x581a16:"充值成功",0x581a4c:"设备",
+              0x581bde:"未连接",0x582c3e:"绑定",0x582d10:"绑定",0x584b80:"设备",0x584d18:"绑定",0x584e82:"设备",
+            },
+          }
+          for fn,tg in targets.items():
+              lines=open(fn,encoding="utf-8",errors="replace").read().splitlines()
+              # build addr->lineno index
+              addrline={}
+              for idx,ln in enumerate(lines):
+                  m=re.match(r'\s*([0-9a-f]{6,})\s',ln)
+                  if m: addrline[int(m.group(1),16)]=idx
+              addrs=sorted(addrline)
+              print(f"\n################ {fn} ################")
+              for vm,name in tg.items():
+                  # otool annotates string refs as '; 0x<vm>' in comments
+                  pat=f"0x{vm:x}"
+                  found=[i for i,ln in enumerate(lines) if pat in ln]
+                  if not found:
+                      print(f"  {name} 0x{vm:x}: NO direct ref in disasm")
+                      continue
+                  for i in found[:6]:
+                      # find enclosing function start: nearest preceding line that is a label-ish (stp/sub/pacibsp/pacibsp or '...:')
+                      fn_start=None
+                      for j in range(i,max(0,i-400),-1):
+                          t=lines[j]
+                          if re.search(r'\b(stp|pacibsp|sub\s+sp,\s*sp)\b',t) and re.match(r'\s*[0-9a-f]+\s',t):
+                              fn_start=int(re.match(r'\s*([0-9a-f]+)',t).group(1),16); break
+                      fs = f"0x{fn_start:x}" if fn_start else "?"
+                      refa = int(re.match(r'\s*([0-9a-f]+)',lines[i]).group(1),16)
+                      print(f"  {name} 0x{vm:x}  ref@0x{refa:x}  func~{fs}")
+                      # print a window of instructions around the ref
+                      lo=max(0,i-6); hi=min(len(lines),i+3)
+                      for k in range(lo,hi):
+                          print("      | "+lines[k])
+          PY
+        shell: bash
+
+      - name: Upload asm
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate6
+          path: |
+            a64.asm
+            a64e.asm
