@@ -1,0 +1,8 @@
+Package: com.zjx.ldys3.unlock
+Name: ldys3 Unlock
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Bypass server verification for 佳影游戏厅3 (com.zjx.ldys3)
+Maintainer: you
+Section: Tweaks
+Depends: ellekit
