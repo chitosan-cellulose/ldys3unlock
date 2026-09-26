@@ -47,16 +47,6 @@ static NSArray *LDClassesWithSelector(SEL sel) {
     return out;
 }
 
-// selector 是否“看起来像”我们关心的账户方法
-static BOOL SELIsTarget(SEL s) {
-    NSString *n = NSStringFromSelector(s);
-    if (!n) return NO;
-    NSArray *keys = @[@"xpire", @"ctivat", @"ogin", @"oggedIn",
-                      @"alid", @"xpired", @"verdue", @"VIP", @"vip"];
-    for (NSString *k in keys) if ([n containsString:k]) return YES;
-    return NO;
-}
-
 // ---------------------------------------------------------------------------
 // 对单个类贪婪 hook：枚举方法，按名称语义强制返回值
 // ---------------------------------------------------------------------------
