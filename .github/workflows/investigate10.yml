@@ -1,0 +1,93 @@
+name: Find live user-status check string & xrefs (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate status-check strings and resolve CFString code xrefs
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output a64
+          lipo -thin arm64e "$F" -output a64e
+          otool -tV a64  > a64.asm
+          python3 - <<'PY'
+          import struct,re
+          blob=open("a64","rb").read()
+          KWS=["无法获取用户状态","用户已过期","无法连接服务器","获取用户状态","用户状态","已过期","过期","无法获取","连接服务器","服务器","请充值","未登录","体验","时长"]
+          hits={}
+          for kw in KWS:
+              i=blob.find(kw.encode("utf-16-le"))
+              while i>=0: hits.setdefault(i,set()).add(kw); i=blob.find(kw.encode("utf-16-le"),i+2)
+          print("== arm64 cstring hits ==")
+          for o in sorted(hits): print(f"  0x{o:x} {sorted(hits[o])}")
+          # resolve cfstrings (arm64 classic pointers)
+          cf={}
+          for o in hits:
+              pat=struct.pack("<Q",o); i=blob.find(pat)
+              while i>=0:
+                  if (i-16)%8==0: cf[i-16]=cf.get(i-16,",".join(sorted(hits[o])))
+                  i=blob.find(pat,i+8)
+          print("== cfstrings ==")
+          for o in sorted(cf): print(f"  0x{o:x} [{cf[o]}]")
+          # adrp+add xref
+          def u32(b,o): return struct.unpack_from("<I",b,o)[0]
+          def adrp_t(pc,ins):
+              if (ins&0x9f000000)!=0x90000000: return None
+              immlo=(ins>>29)&3; immhi=(ins>>5)&0x7ffff; imm=immhi<<2|immlo
+              if imm&(1<<20): imm-=(1<<21)
+              return (pc&~0xfff)+(imm<<12)
+          tg=set(cf); refs={}
+          n=len(blob)//4
+          for i in range(n-1):
+              pc=i*4; t=adrp_t(pc,u32(blob,pc))
+              if t is None: continue
+              rd=u32(blob,pc)&31
+              for j in range(i+1,min(i+6,n)):
+                  w=u32(blob,j*4)
+                  if (w&0xffc00000)==0x91000000 and (w&31)==rd and ((w>>5)&31)==rd:
+                      a=t+(((w>>10)&0xfff)<<(12 if (w>>22)&1 else 0))
+                      if a in tg: refs.setdefault(a,[]).append(pc)
+                      break
+          lines=open("a64.asm",encoding="utf-8",errors="replace").read().splitlines()
+          addrline={}
+          for idx,ln in enumerate(lines):
+              m=re.match(r'\s*([0-9a-f]{5,})\s',ln)
+              if m: addrline[int(m.group(1),16)]=idx
+          print("== xrefs ==")
+          for o in sorted(cf):
+              rs=refs.get(o,[])
+              print(f"\n  CF 0x{o:x} [{cf[o]}] refs={[hex(r) for r in rs]}")
+              for r in rs[:8]:
+                  fn=None
+                  if r in addrline:
+                      for k in range(addrline[r],max(0,addrline[r]-800),-1):
+                          t=lines[k]
+                          if re.match(r'\s*[0-9a-f]+\s',t) and re.search(r'\b(stp|sub\s+sp,\s*sp)\b',t):
+                              fn=int(re.match(r'\s*([0-9a-f]+)',t).group(1),16); break
+                  print(f"    ref@0x{r:x} func~0x{fn:x}" if fn else f"    ref@0x{r:x}")
+                  s=addrline.get(r,0)
+                  for k in range(max(0,s-20),min(len(lines),s+3)):
+                      if re.match(r'\s*[0-9a-f]+\s',lines[k]): print("        | "+lines[k])
+          # dump raw bytes around each ref for patching
+          print("\n== raw bytes near refs ==")
+          for o in sorted(cf):
+              for r in refs.get(o,[])[:3]:
+                  lo=max(0,r-0x40); hi=r+0x10
+                  rb=blob[lo:hi]
+                  print(f"  ref 0x{r:x} [{cf[o]}]:")
+                  for x in range(0,len(rb),16):
+                      print(f"    {lo+x:08x} "+" ".join(f"{b:02x}" for b in rb[x:x+16]))
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate10
+          path: a64.asm
