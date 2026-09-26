@@ -15,34 +15,66 @@ jobs:
           set -e
           mkdir -p out
           python3 - <<'PY'
-          import struct
+          import struct, subprocess
+
+          RET = bytes.fromhex("c0035fd6")
+          # original getter instructions (verified against runtime disasm):
+          LDRB_RET = bytes.fromhex("00404039") + RET   # ldrb w0,[x0,#0x10] ; ret
+          LDR_RET  = bytes.fromhex("001040f9") + RET   # ldr  x0,[x0,#0x20] ; ret
+          # replacements:
+          MOV1_RET = bytes.fromhex("20008052") + RET   # mov w0,#1 ; ret
+          FAR_RET  = bytes.fromhex("a054bed2") + RET   # movz x0,#0xF2A5,lsl#16 ; ret  (~year 2099)
+
           patches = {
             "arm64e": [
-              # login -> mov w0,#1 ; ret
-              (0x347894, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
-              # loggedIn -> mov w0,#1 ; ret
-              (0x3cf300, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
-              # expireTime -> movz x0,#0xF2A5,lsl#16 (year ~2099) ; ret
-              (0x3cf310, bytes.fromhex("000840f9c0035fd6"), bytes.fromhex("a054bed2c0035fd6")),
+              (0x347894, LDRB_RET, MOV1_RET),  # login
+              (0x3cf300, LDRB_RET, MOV1_RET),  # loggedIn
+              (0x3cf310, LDR_RET,  FAR_RET),   # expireTime
             ],
             "arm64": [
-              (0x33f3f0, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
-              (0x3c3554, bytes.fromhex("00004139c0035fd6"), bytes.fromhex("20008052c0035fd6")),
-              (0x3c3564, bytes.fromhex("000840f9c0035fd6"), bytes.fromhex("a054bed2c0035fd6")),
+              (0x33f3f0, LDRB_RET, MOV1_RET),  # login
+              (0x3c3554, LDRB_RET, MOV1_RET),  # loggedIn
+              (0x3c3564, LDR_RET,  FAR_RET),   # expireTime
             ],
           }
+
+          def text_seg(path):
+              with open(path,"rb") as f:
+                  magic = struct.unpack_from("<I", f.read(4))[0]
+                  assert magic in (0xfeedfacf, 0xfeedface), hex(magic)
+                  is64 = magic == 0xfeedfacf
+                  f.seek(16)
+                  ncmds = struct.unpack_from("<I", f.read(4))[0]
+                  off = 32 if is64 else 28
+                  for _ in range(ncmds):
+                      f.seek(off)
+                      cmd, cmdsize = struct.unpack_from("<II", f.read(8))
+                      if (is64 and cmd == 0x19) or ((not is64) and cmd == 0x1):
+                          name = f.read(16).rstrip(b"\x00")
+                          if is64:
+                              vmaddr, vsize, fileoff, filesize = struct.unpack_from("<QQQQ", f.read(32))
+                          else:
+                              vmaddr, vsize, fileoff, filesize = struct.unpack_from("<IIII", f.read(16))
+                          if name == b"__TEXT":
+                              return vmaddr, fileoff
+                      off += cmdsize
+              raise RuntimeError("__TEXT not found")
+
           for arch, plist in patches.items():
-            src = f"out/sbs.{arch}"
-            import subprocess
-            subprocess.run(["lipo","-thin",arch,"bin/SpringBoardService.dylib","-o",src], check=True)
-            with open(src,"rb") as f: data=bytearray(f.read())
-            for off, exp, rep in plist:
-                cur=bytes(data[off:off+len(exp)])
-                print(f"[{arch}] off=0x{off:x} orig={cur.hex()} expect={exp.hex()} match={cur==exp}")
-                assert cur==exp, f"byte mismatch at 0x{off:x}: {cur.hex()} != {exp.hex()}"
-                data[off:off+len(rep)]=rep
-            with open(src,"wb") as f: f.write(data)
-            print(f"[{arch}] patched {src}")
+              src = f"out/sbs.{arch}"
+              subprocess.run(["lipo","-thin",arch,"bin/SpringBoardService.dylib","-o",src], check=True)
+              vmaddr, fileoff = text_seg(src)
+              delta = fileoff - vmaddr   # file offset = vm + delta
+              print(f"[{arch}] __TEXT vmaddr=0x{vmaddr:x} fileoff=0x{fileoff:x} delta=0x{delta:x}")
+              with open(src,"rb") as f: data=bytearray(f.read())
+              for vm, exp, rep in plist:
+                  off = vm + delta
+                  cur = bytes(data[off:off+len(exp)])
+                  print(f"[{arch}] vm=0x{vm:x} fileoff=0x{off:x} orig={cur.hex()} expect={exp.hex()} match={cur==exp}")
+                  assert cur==exp, f"byte mismatch at vm=0x{vm:x} fileoff=0x{off:x}: {cur.hex()} != {exp.hex()}"
+                  data[off:off+len(rep)] = rep
+              with open(src,"wb") as f: f.write(data)
+              print(f"[{arch}] patched {src}")
           PY
           # re-sign each thin slice
           for arch in arm64 arm64e; do
