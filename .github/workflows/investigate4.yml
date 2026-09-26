@@ -1,0 +1,69 @@
+name: Investigate getExpireStatus completion block raw bytes (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  disasm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disasm both slices
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output thin64
+          lipo -thin arm64e "$F" -output thin64e
+          otool -tV thin64  > arm64.asm
+          otool -tV thin64e > arm64e.asm
+          wc -l arm64.asm arm64e.asm
+        shell: bash
+
+      - name: Dump getExpireStatus + completion disasm and raw bytes
+        run: |
+          set -e
+          python3 - <<'PY'
+          import struct, subprocess
+          # regions of interest (method IMP + completion block invoke)
+          ranges = {
+            "arm64":  [(0x33e000,0x33e700),(0x33df00,0x33e0f0)],
+            "arm64e": [(0x346400,0x346b00),(0x3463f0,0x3464f8)],
+          }
+          for arch,rs in ranges.items():
+              thin = "thin64" if arch=="arm64" else "thin64e"
+              print(f"\n############### {arch} ({thin}) ###############")
+              for (lo,hi) in rs:
+                  out=subprocess.run(["otool","-tV",f"-p",hex(lo),"-c","0","--",thin],
+                                     capture_output=True,text=True).stdout
+                  # otool -tV prints whole; filter lines in range
+                  lines=out.splitlines()
+                  kept=[]
+                  for ln in lines:
+                      tk=ln.split("\t")[0].strip() if ln.startswith("\t") else None
+                      # simpler: lines beginning with hex address
+                      import re
+                      m=re.match(r'\s*([0-9a-f]{6,})\s',ln)
+                      if m:
+                          a=int(m.group(1),16)
+                          if lo<=a<hi: kept.append(ln)
+                  print(f"\n--- disasm {hex(lo)}..{hex(hi)} ---")
+                  print("\n".join(kept))
+              # raw bytes dump of completion-block regions
+              data=open(thin,"rb").read()
+              for (lo,hi) in rs:
+                  print(f"\n--- raw bytes {hex(lo)}..{hex(hi)} (file offset == VM) ---")
+                  chunk=data[lo:hi]
+                  for o in range(0,len(chunk),32):
+                      b=chunk[o:o+32]
+                      print(f"{lo+o:08x}  "+" ".join(f"{x:02x}" for x in b))
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate4
+          path: |
+            arm64.asm
+            arm64e.asm
