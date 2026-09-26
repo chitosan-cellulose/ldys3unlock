@@ -1,0 +1,43 @@
+name: Investigate connection logic
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  investigate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Disassemble + search connection logic
+        run: |
+          mkdir -p out
+          for arch in arm64 arm64e; do
+            lipo -thin "$arch" bin/SpringBoardService.dylib -o "out/sbs.$arch" 2>/dev/null || cp bin/SpringBoardService.dylib "out/sbs.$arch"
+            otool -ov "out/sbs.$arch" > "out/sbs.$arch.objc" 2>/dev/null
+            otool -tvV "out/sbs.$arch" > "out/sbs.$arch.asm" 2>/dev/null
+            echo "########## SpringBoardService $arch ##########"
+
+            echo "===== [$arch] FULL getExpireStatusWithCompletionHandler: (220 lines) ====="
+            imp=$(awk '$1=="name" && $NF=="getExpireStatusWithCompletionHandler:" {f=1} f && $1=="imp" {print $2; exit}' "out/sbs.$arch.objc")
+            hx=${imp#0x}
+            echo "imp=$imp"
+            [ -n "$hx" ] && grep -A220 -m1 "$hx	" "out/sbs.$arch.asm" | head -225
+
+            echo "===== [$arch] methods whose name contains connect/device/bind/Device/Connect ====="
+            grep -iE "connect|device|bind|online|status|register|serial" "out/sbs.$arch.objc" | grep -E "name|imp" | head -120
+
+            echo "===== [$arch] strings: connection / device related ====="
+            strings -a "out/sbs.$arch" | grep -nE "未连接|已连接|当前设备|设备|连接|connect|Connect|device|Device|bind|Bind|online|Online|注册" | head -120
+
+            echo "===== [$arch] cstring refs (with file offsets) for connection words ====="
+            otool -v -s __TEXT __cstring "out/sbs.$arch" 2>/dev/null | grep -iE "未连接|已连接|当前设备|connect|device|bind|online|设备|连接" | head -80
+          done
+          ls -l out
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate
+          path: out/
+          if-no-files-found: error
