@@ -1,0 +1,105 @@
+name: Disasm windows around ldysdaemon string refs (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write script
+        run: |
+          cat > win.py <<'PYEOF'
+          import struct, os, subprocess, re
+
+          def u32(b, o): return struct.unpack_from("<I", b, o)[0]
+
+          def adrp_page(pc, ins):
+              # returns target page base, or None
+              if (ins & 0x9f000000) != 0x90000000:
+                  return None
+              immlo = (ins >> 29) & 3
+              immhi = (ins >> 5) & 0x7ffff
+              imm = (immhi << 2) | immlo
+              if imm & (1 << 20):
+                  imm -= (1 << 21)
+              return (pc & ~0xfff) + (imm << 12)
+
+          # strings all live in page 0x7000 of the thin slice (file offset == VM-0x100000000)
+          TARGET_PAGE = 0x7000
+
+          for arch in ("arm64e", "arm64"):
+              thin = "out/ldysdaemon.%s" % arch
+              if not os.path.exists(thin):
+                  os.system("mkdir -p out && lipo -thin %s bin/ldysdaemon -output %s 2>/dev/null" % (arch, thin))
+              if not os.path.exists(thin):
+                  print("NO", arch); continue
+              blob = open(thin, "rb").read()
+              print("\n################ ldysdaemon %s (size %d) ################" % (arch, len(blob)))
+              # find every adrp targeting page 0x7000
+              hits = []
+              n = len(blob) // 4
+              for i in range(n):
+                  pc = i * 4
+                  pg = adrp_page(pc, u32(blob, pc))
+                  if pg == TARGET_PAGE:
+                      hits.append(pc)
+              print("adrp -> page 0x7000 count:", len(hits))
+              # cluster hits that are within 0x100 of each other -> one window center
+              clusters = []
+              for h in sorted(hits):
+                  if clusters and h - clusters[-1][-1] < 0x140:
+                      clusters[-1].append(h)
+                  else:
+                      clusters.append([h])
+              print("clusters:", [hex(c[0]) for c in clusters])
+              # produce full disasm once
+              asm = subprocess.run(["otool", "-tV", thin], capture_output=True, text=True).stdout.splitlines()
+              # parse address from lines like "0000000100004f7c\t..."
+              def addr_of(line):
+                  m = re.match(r'\s*([0-9a-fA-F]+)\s', line)
+                  if not m: return None
+                  return int(m.group(1), 16) - 0x100000000
+              addr_lines = [(addr_of(l), l) for l in asm]
+              addr_lines = [(a, l) for (a, l) in addr_lines if a is not None]
+              for ci, cl in enumerate(clusters):
+                  center = cl[0]
+                  lo = max(0, center - 0x60)
+                  hi = center + 0x180
+                  print("\n------ cluster %d: refs %s, window 0x%x..0x%x ------" % (ci, [hex(x) for x in cl], lo, hi))
+                  for a, l in addr_lines:
+                      if lo <= a <= hi:
+                          print(l)
+              # also dump raw bytes at every branch insn inside these windows for patching prep
+              print("\n==== raw bytes at branch/cmp insns in windows ====")
+              branch_ops = {0x34: "cbz", 0x35: "cbnz", 0x54: "b.cond", 0x14: "b", 0x15: "bl"}
+              winpcs = set()
+              for cl in clusters:
+                  for c in cl:
+                      for p in range(max(0, c - 0x60), min(len(blob) // 4, (c + 0x180) // 4 + 1)):
+                          winpcs.add(p * 4)
+              for pc in sorted(winpcs):
+                  ins = u32(blob, pc)
+                  op = ins >> 24
+                  if op in branch_ops or op == 0x71 or op == 0xf1 or op == 0x6b or op == 0xeb:  # cmp/sub variants
+                      b = struct.pack("<I", ins)
+                      print("0x%x  %02x %02x %02x %02x" % (pc, b[0], b[1], b[2], b[3]))
+          PYEOF
+          echo "win.py written: $(wc -l < win.py) lines"
+        shell: bash
+
+      - name: Run window disasm
+        run: |
+          set -e
+          mkdir -p out
+          for a in arm64e arm64; do lipo -thin $a bin/ldysdaemon -output out/ldysdaemon.$a 2>/dev/null; done
+          python3 win.py
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate14
+          path: out/
