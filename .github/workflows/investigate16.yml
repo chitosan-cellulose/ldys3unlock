@@ -1,0 +1,63 @@
+name: nm symbols + disasm xpcMessageCallback region of ldysdaemon
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: nm symbols
+        run: |
+          set -e
+          mkdir -p out
+          for a in arm64e arm64; do lipo -thin $a bin/ldysdaemon -output out/ldysdaemon.$a 2>/dev/null; done
+          for a in arm64e arm64; do
+            echo "########## nm ldysdaemon $a ##########"
+            nm -n "out/ldysdaemon.$a" 2>/dev/null | grep -iE 'xpc|activation|serial|device|reply|pong|server|status|http|json|URL|request|main' || true
+          done
+        shell: bash
+
+      - name: Disasm xpcMessageCallback + main regions (arm64e)
+        run: |
+          P=out/ldysdaemon.arm64e
+          echo "== full symbol list (text) =="
+          nm -n "$P" 2>/dev/null | grep -E ' [Tt] ' | head -80
+          echo
+          echo "== locate xpcMessageCallback =="
+          XPC=$(nm -n "$P" 2>/dev/null | grep -i xpcMessageCallback | head -1 | awk '{print $1}')
+          echo "xpcMessageCallback VM = $XPC"
+          if [ -n "$XPC" ]; then
+            BASE=0x100000000
+            # convert to decimal window
+            python3 - "$XPC" "$P" <<'PY'
+          import sys,subprocess
+          xpc=int(sys.argv[1],16); p=sys.argv[2]
+          base=0x100000000
+          lo=xpc-0x20; hi=xpc+0x900
+          asm=subprocess.run(["otool","-tV",p],capture_output=True,text=True).stdout.splitlines()
+          import re
+          for l in asm:
+              m=re.match(r'\s*([0-9a-fA-F]+)\s',l)
+              if not m: continue
+              a=int(m.group(1),16)
+              if lo<=a<=hi: print(l)
+          PY
+          fi
+        shell: bash
+
+      - name: Disasm URL/http request region (arm64e)
+        run: |
+          P=out/ldysdaemon.arm64e
+          echo "== grep full asm for URL / statusCode / JSON / dataTask / reply =="
+          otool -tV "$P" 2>/dev/null > out/full.asm
+          grep -nE '116\.62|statusCode|NSJSON|JSONObjectWith|dataTask|completionHandler|URLWithString|setHTTPBody|httpBody|response|statusCode|b\.(ne|eq|lt|gt|le|ge|hs|lo)|cbz|cbnz|cmp |replyActivation|setActivation|getActivation|pongDaemon|replyServer' out/full.asm | head -250
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate16
+          path: out/
