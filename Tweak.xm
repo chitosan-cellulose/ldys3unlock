@@ -103,7 +103,7 @@ static void LDHookSpringBoardAccount(void) {
 
     orig_login = (id(*)(id,SEL))LDHook(cls, @selector(login), (IMP)new_login, "c@:");
     orig_expireTime = (long long(*)(id,SEL))LDHook(cls, @selector(expireTime), (IMP)new_expireTime, "q@:");
-    orig_expireTimeString = (id(*)(id,SEL))LDHook(cls, @selector(expireTimeString), (IMP)new_expireTimeString, "@@:");
+    orig_expireTimeString = (NSString *(*)(id,SEL))LDHook(cls, @selector(expireTimeString), (IMP)new_expireTimeString, "@@:");
     orig_setLogin = (void(*)(id,SEL,BOOL))LDHook(cls, @selector(setLogin:), (IMP)new_setLogin, "v@:c");
     orig_setExpireTime = (void(*)(id,SEL,long long))LDHook(cls, @selector(setExpireTime:), (IMP)new_setExpireTime, "v@:q");
     orig_setExpireTimeString = (void(*)(id,SEL,id))LDHook(cls, @selector(setExpireTimeString:), (IMP)new_setExpireTimeString, "v@:@");
@@ -130,7 +130,6 @@ static void LDHookDaemonActivation(void) {
         Method m = class_getInstanceMethod(cls, s);
         if (!m) m = class_getClassMethod(cls, s);
         if (m) {
-            IMP cur = method_getImplementation(m);
             IMP yes = imp_implementationWithBlock(^BOOL(id slf){ return YES; });
             method_setImplementation(m, yes);
             NSLog(@"[ldys3_unlock] forced %@ -> YES", name);
