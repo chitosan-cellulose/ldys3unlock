@@ -27,6 +27,7 @@ jobs:
           # replacements:
           MOV1_RET = bytes.fromhex("20008052") + RET   # mov w0,#1 ; ret
           FAR_RET  = bytes.fromhex("a054bed2") + RET   # movz x0,#0xF2A5,lsl#16 ; ret  (~year 2099)
+          NOP = bytes.fromhex("1f2003d5")              # nop
 
           patches = {
             "arm64e": [
@@ -34,12 +35,20 @@ jobs:
               (0x3cf300, LDRB_RET, MOV1_RET),  # loggedIn
               (0x3cf310, LDR_RET,  FAR_RET),   # expireTime
               (0x33fe20, LDRW_RET, MOV1_RET),  # connectedDeviceType -> always connected (1)
+              # --- getExpireStatus completion block: force server-verification to always SUCCEED ---
+              (0x346828, bytes.fromhex("c1040054"), NOP),  # b.ne (code!=-999 -> fail)  -> nop
+              (0x3468d8, bytes.fromhex("e1070054"), NOP),  # b.ne (statusCode!=200)    -> nop
+              (0x34698c, bytes.fromhex("f3060034"), NOP),  # cbz w19 (boolValue false) -> nop
             ],
             "arm64": [
               (0x33f3f0, LDRB_RET, MOV1_RET),  # login
               (0x3c3554, LDRB_RET, MOV1_RET),  # loggedIn
               (0x3c3564, LDR_RET,  FAR_RET),   # expireTime
               (0x337d0c, LDRW_RET, MOV1_RET),  # connectedDeviceType -> always connected (1)
+              # --- getExpireStatus completion block: force server-verification to always SUCCEED ---
+              (0x33e40c, bytes.fromhex("a1040054"), NOP),  # b.ne (code!=-999 -> fail)  -> nop
+              (0x33e4b8, bytes.fromhex("81070054"), NOP),  # b.ne (statusCode!=200)    -> nop
+              (0x33e564, bytes.fromhex("b3060034"), NOP),  # cbz w19 (boolValue false) -> nop
             ],
           }
 
