@@ -20,7 +20,7 @@ jobs:
       - name: Build package (RootHide / arm64e)
         run: |
           make clean || true
-          make package THEOS_PACKAGE_SCHEME=roothide
+          make package THEOS_PACKAGE_SCHEME=rootless
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
