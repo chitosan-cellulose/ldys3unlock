@@ -1,0 +1,91 @@
+name: Final clean disasm (llvm-objdump) + resolve all selectors
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Thin slices
+        run: |
+          mkdir -p out
+          for b in ldysdaemon BackboardService.dylib SpringBoardService.dylib; do
+            lipo -thin arm64e bin/$b -output out/$b.arm64e 2>/dev/null || true
+            lipo -thin arm64  bin/$b -output out/$b.arm64  2>/dev/null || true
+          done
+        shell: bash
+
+      - name: llvm-objdump full disasm ldysdaemon arm64e (clean, with annotations)
+        run: |
+          echo "######## ldysdaemon arm64e __TEXT,__text ########"
+          objdump -d --section=__TEXT,__text out/ldysdaemon.arm64e 2>/dev/null | sed -n '1,420p'
+        shell: bash
+
+      - name: Resolve selref slot -> selector name (fixed VM->fileoff) + cfstrings
+        run: |
+          cat > res2.py <<'PYEOF'
+          import struct, os
+          def load(path):
+              d=open(path,'rb').read(); off=0x20
+              ncmds=struct.unpack_from("<I",d,16)[0]; sects={}; base=0
+              for _ in range(ncmds):
+                  cmd,sz=struct.unpack_from("<II",d,off)
+                  if cmd==0x19:
+                      nsects=struct.unpack_from("<I",d,off+64)[0]; so=off+72
+                      for _ in range(nsects):
+                          sname=d[so:so+16].split(b'\0')[0].decode()
+                          addr=struct.unpack_from("<Q",d,so+32)[0]
+                          size=struct.unpack_from("<Q",d,so+40)[0]
+                          foff=struct.unpack_from("<I",d,so+48)[0]
+                          sects[sname]=(addr,size,foff); so+=80
+                  off+=sz
+              return d,sects
+          def cstr(d,o):
+              e=d.find(b'\0',o); return d[o:(e if e>0 else o+60)].decode('utf-8','replace')
+          def decode(ptr, mask=0xFFFFFFFFF): return ptr & mask
+          p="out/ldysdaemon.arm64e"; d,sects=load(p)
+          sel=sects['__objc_selrefs']; meth=sects['__objc_methname']
+          a0,asize,afoff=sel
+          slotmap={}
+          print("=== selref slot (VM) -> selector ===")
+          for i in range(0,asize,8):
+              raw=struct.unpack_from("<Q",d,afoff+i)[0]
+              target=raw & 0xFFFFFFFFF
+              fo=target-0x100000000
+              nm=cstr(d,fo) if 0<=fo<len(d) else '?'
+              slotmap[a0+i]=nm
+              print("  0x%x = %s"%(a0+i,nm))
+          cf=sects['__cfstring']; cs=sects['__cstring']
+          c0,csz,cfo=cf
+          print("\n=== cfstring struct VM -> text ===")
+          for i in range(0,csz,32):
+              sp=struct.unpack_from("<Q",d,cfo+i+16)[0]
+              fo=(sp&0xFFFFFFFFF)-0x100000000
+              txt=cstr(d,fo) if 0<=fo<len(d) else ''
+              if txt.strip(): print("  cf@0x%x -> %r"%(c0+i,txt))
+          print("\n=== ALL cstrings (__cstring) ===")
+          s0,ssz,soff=cs
+          o=soff; end=soff+ssz
+          while o<end:
+              e=d.find(b'\0',o)
+              if e<0 or e>end: break
+              s=d[o:e].decode('utf-8','replace')
+              if s.strip(): print("  0x%x: %r"%(o,s))
+              o=e+1
+          PYEOF
+          python3 res2.py
+        shell: bash
+
+      - name: llvm-objdump BackboardService arm64e (grep auth/user status strings)
+        run: |
+          echo "######## strings (unicode) BackboardService arm64e ########"
+          strings -a out/BackboardService.arm64e | grep -aiE '用户|状态|过期|连接|激活|授权|valid|expire|auth|status|无法|服务器' | head -40
+          echo "######## nm BackboardService ########"
+          nm out/BackboardService.arm64e 2>/dev/null | grep -iE 'xpc|pong|hid|inject|digitizer|auth|status|valid' | head -40
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate18, path: out/ }
