@@ -1,0 +1,57 @@
+name: Patch & sign ldysdaemon (force activation reply)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Patch ldysdaemon getActivationCode gate (arm64e) + re-sign
+        run: |
+          set -e
+          mkdir -p out
+          python3 - <<'PY'
+          src = "bin/ldysdaemon"
+          data = bytearray(open(src,"rb").read())
+
+          NOP = bytes.fromhex("1f2003d5")
+
+          # arm64e slice lives at fat file offset 0x18000.
+          # Within the thin slice, file offset == VM - 0x100000000.
+          # xpcMessageCallback gate: tbnz w9, #0x0, 0x5144  @ VM 0x1000051e0
+          #   -> forces getActivationCode to bail when stored code is null.
+          #   Replace with NOP so the daemon ALWAYS replies replyActivationCode.
+          ARM64E_SLICE = 0x18000
+          GATE_VM = 0x51e0
+          off = ARM64E_SLICE + GATE_VM
+
+          ORIG = bytes.fromhex("29fb0737")      # tbnz w9,#0,0x5144 (verified locally)
+          cur = bytes(data[off:off+4])
+          print("arm64e gate @ fat 0x%x = %s" % (off, cur.hex()))
+          assert cur == ORIG, "arm64e gate bytes mismatch: got %s want %s" % (cur.hex(), ORIG.hex())
+          data[off:off+4] = NOP
+          print("patched arm64e gate -> nop")
+
+          open("out/ldysdaemon","wb").write(data)
+          PY
+
+          echo "--- re-sign (ad-hoc) ---"
+          ldid -S out/ldysdaemon
+          echo "--- verify signature present ---"
+          ldid -e out/ldysdaemon | head -5 || true
+          ls -l out/ldysdaemon
+
+      - name: Re-disassemble patched region to confirm
+        run: |
+          lipo -thin arm64e out/ldysdaemon -output out/ldysdaemon.arm64e
+          otool -tV out/ldysdaemon.arm64e 2>/dev/null | grep -A2 -B6 '51e0' | head -30 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ldysdaemon-patched
+          path: out/ldysdaemon
