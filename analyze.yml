@@ -1,0 +1,33 @@
+name: Analyze original binaries
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Disassemble arm64e slices
+        run: |
+          mkdir -p out
+          for f in bin/*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            echo "=== $base : file ===" ; file "$f"
+            echo "=== $base : archs ===" ; lipo -info "$f" || true
+            lipo -thin arm64e "$f" -o "out/$base.arm64e" 2>/dev/null || cp "$f" "out/$base.arm64e"
+            echo "=== $base : load cmds ===" ; otool -l "out/$base.arm64e" | grep -A3 -E "LC_ENCRYPTION|LC_LOAD_DYLIB|LC_ID_DYLIB|name " | head -80
+            echo "=== $base : strings (verify related) ===" ; strings -a "out/$base.arm64e" | grep -iE "activ|expire|valid|login|jyyxt|116.62|verify|deposit|serial" | sort -u | head -120
+            echo "=== $base : disasm (functions) ===" ; otool -tvV "out/$base.arm64e" > "out/$base.arm64e.asm" 2>/dev/null
+            wc -l "out/$base.arm64e.asm"
+          done
+          ls -l out
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis
+          path: out/
+          if-no-files-found: error
