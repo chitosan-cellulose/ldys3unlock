@@ -1,0 +1,120 @@
+name: Decode code xrefs to activation CFStrings via raw adrp math (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: adrp-math xref scan + disasm window
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          lipo -thin arm64  "$F" -output a64
+          lipo -thin arm64e "$F" -output a64e
+          otool -tV a64  > a64.asm
+          otool -tV a64e > a64e.asm
+          python3 - <<'PY'
+          import struct,re
+          # CFString base addresses per slice (arm64 from prior; arm64e we'll resolve via chained pointers)
+          CF={
+            "a64":{0x5a2c50:"未连接",0x5a3110:"充值失败",0x5a3150:"充值成功",0x5a3570:"未连接",0x5aacf0:"绑定"},
+          }
+          def u32(b,o): return struct.unpack_from("<I",b,o)[0]
+          def adrp_t(pc,ins):
+              if (ins&0x9f000000)!=0x90000000: return None
+              immlo=(ins>>29)&3; immhi=(ins>>5)&0x7ffff; imm=immhi<<2|immlo
+              if imm&(1<<20): imm-=(1<<21)
+              return (pc&~0xfff)+(imm<<12)
+
+          def scan(arch, blob, targets):
+              n=len(blob)//4; refs={}
+              for i in range(n-1):
+                  pc=i*4; t=adrp_t(pc,u32(blob,pc))
+                  if t is None: continue
+                  rd=u32(blob,pc)&31
+                  for j in range(i+1,min(i+6,n)):
+                      w=u32(blob,j*4)
+                      # add xd,xd,#imm12
+                      if (w&0xffc00000)==0x91000000 and (w&31)==rd and ((w>>5)&31)==rd:
+                          imm12=(w>>10)&0xfff; sh=(w>>22)&1
+                          a=t+(imm12<<(12 if sh else 0))
+                          if a in targets: refs.setdefault(a,[]).append(pc)
+                          break
+                      # ldr xd,[xd,#imm] -> a = t+imm*8  (ldr of pointer, target is the loaded value not addr; skip)
+              return refs
+
+          for arch,targets in CF.items():
+              blob=open(arch,"rb").read()
+              refs=scan(arch,blob,targets)
+              lines=open(arch+".asm",encoding="utf-8",errors="replace").read().splitlines()
+              addrline={}
+              for idx,ln in enumerate(lines):
+                  m=re.match(r'\s*([0-9a-f]{5,})\s',ln)
+                  if m: addrline[int(m.group(1),16)]=idx
+              print(f"\n################ {arch} ################")
+              for a,name in targets.items():
+                  rs=refs.get(a,[])
+                  print(f"\n  CFString 0x{a:x} [{name}]  refs={[hex(r) for r in rs]}")
+                  for r in rs[:6]:
+                      # enclosing function
+                      fn_start=None
+                      if r in addrline:
+                          for k in range(addrline[r],max(0,addrline[r]-700),-1):
+                              t=lines[k]
+                              if re.match(r'\s*[0-9a-f]+\s',t) and re.search(r'\b(stp|pacibsp|sub\s+sp,\s*sp)\b',t):
+                                  fn_start=int(re.match(r'\s*([0-9a-f]+)',t).group(1),16); break
+                      fs=f"0x{fn_start:x}" if fn_start else "?"
+                      print(f"    ref@0x{r:x} func~{fs}")
+                      s=addrline.get(r,0)
+                      for k in range(max(0,s-14),min(len(lines),s+4)):
+                          if re.match(r'\s*[0-9a-f]+\s',lines[k]): print("        | "+lines[k])
+
+          # ---- arm64e: resolve cfstring via chained fixups, then xref scan ----
+          print("\n################ a64e (chained pointer resolve) ################")
+          blob=open("a64e","rb").read()
+          cstrs={0x5818ec:"未连接",0x581a00:"充值失败",0x581a16:"充值成功",0x581a4c:"设备",0x581bde:"未连接",0x582c3e:"绑定",0x582d10:"绑定",0x584b80:"设备",0x584d18:"绑定",0x584e82:"设备"}
+          # chained fixup: value = (raw & 0xFFFFFFFFFFFFFF) ; high bit indicates auth. Try mask 0x0fffffffffffffff (48-bit)
+          cf64={}
+          for off in range(0,len(blob)-8,8):
+              raw=struct.unpack_from("<Q",blob,off)[0]
+              if raw==0: continue
+              v=raw & 0x0FFFFFFFFFFFFFFF
+              if v in cstrs and (off-16)%8==0:
+                  cf64[off-16]=cf64.get(off-16,cstrs[v])
+          # also try mask without high trunc
+          print(f"a64e cfstrings: { {hex(k):v for k,v in sorted(cf64.items())} }")
+          refs=scan("a64e",blob,set(cf64))
+          lines=open("a64e.asm",encoding="utf-8",errors="replace").read().splitlines()
+          addrline={}
+          for idx,ln in enumerate(lines):
+              m=re.match(r'\s*([0-9a-f]{5,})\s',ln)
+              if m: addrline[int(m.group(1),16)]=idx
+          for a,name in sorted(cf64.items()):
+              rs=refs.get(a,[])
+              print(f"\n  CFString 0x{a:x} [{name}] refs={[hex(r) for r in rs]}")
+              for r in rs[:6]:
+                  fn_start=None
+                  if r in addrline:
+                      for k in range(addrline[r],max(0,addrline[r]-700),-1):
+                          t=lines[k]
+                          if re.match(r'\s*[0-9a-f]+\s',t) and re.search(r'\b(stp|pacibsp|sub\s+sp,\s*sp)\b',t):
+                              fn_start=int(re.match(r'\s*([0-9a-f]+)',t).group(1),16); break
+                  fs=f"0x{fn_start:x}" if fn_start else "?"
+                  print(f"    ref@0x{r:x} func~{fs}")
+                  s=addrline.get(r,0)
+                  for k in range(max(0,s-14),min(len(lines),s+4)):
+                      if re.match(r'\s*[0-9a-f]+\s',lines[k]): print("        | "+lines[k])
+          PY
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigate8
+          path: |
+            a64.asm
+            a64e.asm
