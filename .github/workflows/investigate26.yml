@@ -1,0 +1,24 @@
+name: Grep disasm for toast + success refs
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: grep objdump for all refs
+        run: |
+          objdump -d out/sbs.arm64e > out/full.asm 2>/dev/null
+          echo "lines containing key addresses:"
+          grep -nE "33f020|33f090|33f100|5adeb0|5aded0|5adef0|3aa66c|5156c0|5156d5" out/full.asm | head -80
+          echo "---- how is 0x3aa66c referenced? context ----"
+          grep -n "3aa66c" out/full.asm | head
+          echo "---- total lines ----"; wc -l out/full.asm
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate26, path: out/full.asm }
