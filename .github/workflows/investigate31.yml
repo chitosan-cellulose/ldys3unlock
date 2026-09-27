@@ -1,0 +1,117 @@
+name: Find recharge decision branch (comprehensive)
+
+on:
+  workflow_dispatch
+
+jobs:
+  find:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: thin arm64e
+        run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: python: map cfstrings, find refs, list branches in window
+        run: |
+          set +e
+          python3 - <<'PY' > out/refs.txt 2>&1
+          import struct
+          d=open('out/sbs.arm64e','rb').read()
+          ncmds=struct.unpack_from('<I',d,16)[0]
+          off=32; sects={}
+          for _ in range(ncmds):
+              cmd,cs=struct.unpack_from('<II',d,off)
+              if cmd==0x19:
+                  ns=struct.unpack_from('<I',d,off+64)[0]; so=off+72
+                  for i in range(ns):
+                      sn=d[so:so+16].split(b'\0')[0].decode('latin1')
+                      sa,ss,so_=struct.unpack_from('<QQI',d,so+32)
+                      sects[sn]=(sa,ss,so_); so+=80
+              off+=cs
+          def u32(o): return struct.unpack_from('<I',d,o)[0]
+          texts={'recharge_fail':0x581a00,'status_fail':0x58190e,'start_fail':0x5818ce}
+          ca,cs,co=sects['__cfstring']; cf={}
+          for o in range(co,co+cs,0x20):
+              ptr=struct.unpack_from('<Q',d,o+16)[0]; cf[ptr]=ca+(o-co)
+          print("### cfstring mapping ###")
+          for n,t in texts.items(): print(f"  {n}: text=0x{t:x} cf=0x{cf.get(t,0):x}")
+          targets=[cf[t] for t in texts.values() if t in cf]
+          def sx(v,b):
+              if v&(1<<(b-1)): v-=(1<<b)
+              return v
+          ta,ts,to=sects['__text']; refs=[]
+          end=min(to+ts,len(d)); i=to
+          while i+32<end:
+              vm=ta+(i-to); ins=u32(i)
+              if (ins&0x9F000000)==0x90000000:
+                  rd=ins&31; immlo=(ins>>29)&3; immhi=(ins>>5)&0x1FFFFF
+                  page=(vm&~0xFFF)+sx((immhi<<2)|immlo,21)*4096
+                  for k in range(1,7):
+                      i2=u32(i+4*k)
+                      if (i2&0xFFC00000)==0xF9400000 and ((i2>>5)&31)==rd:
+                          S=page+((i2>>10)&0xFFF)*8
+                          if S in targets: refs.append((S,vm+4*k))
+                      if (i2&0x7F800000)==0x11000000 and ((i2>>5)&31)==rd:
+                          S=page+((i2>>10)&0xFFF)
+                          if S in targets: refs.append((S,vm+4*k))
+              i+=4
+          print("### code refs (access VM that loads the cfstring) ###")
+          seen=set()
+          accs=[]
+          for S,acc in refs:
+              if acc in seen: continue
+              seen.add(acc); accs.append(acc)
+              print(f"REF cf=0x{S:x} access=0x{acc:x}")
+          if not accs:
+              print("NO DIRECT REFS FOUND (string likely loaded via indirect fixup / selector dispatch)")
+          # branch listing around each access
+          print("\n### branches within +/-0x300 of each access ###")
+          for acc in accs:
+              print(f"\n--- window for access 0x{acc:x} ---")
+              w0=max(to, acc-0x300); w1=acc+0x300
+              j=w0
+              while j<w1:
+                  vm=ta+(j-to); ins=u32(j)
+                  b=None
+                  if (ins&0xFF000010)==0x54000000:   # cond branch B.cond
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; tgt=vm+imm
+                      cond=ins&0xF; nm={0:'eq',1:'ne',2:'cs',3:'cc',4:'mi',5:'pl',6:'vs',7:'vc',8:'hi',9:'ls',10:'ge',11:'lt',12:'gt',13:'le',14:'al'}.get(cond,'?')
+                      b=f"b.{nm} 0x{tgt:x}"
+                  elif (ins&0x7E000000)==0x34000000: # cbz w
+                      rt=ins&31; imm=sx((ins>>5)&0x7FFFF,19)*4; tgt=vm+imm; b=f"cbz w{rt}, 0x{tgt:x}"
+                  elif (ins&0x7E000000)==0x35000000: # cbnz w
+                      rt=ins&31; imm=sx((ins>>5)&0x7FFFF,19)*4; tgt=vm+imm; b=f"cbnz w{rt}, 0x{tgt:x}"
+                  elif (ins&0x7E000000)==0xB4000000: # cbz x
+                      rt=ins&31; imm=sx((ins>>5)&0x7FFFF,19)*4; tgt=vm+imm; b=f"cbz x{rt}, 0x{tgt:x}"
+                  elif (ins&0x7E000000)==0xB5000000: # cbnz x
+                      rt=ins&31; imm=sx((ins>>5)&0x7FFFF,19)*4; tgt=vm+imm; b=f"cbnz x{rt}, 0x{tgt:x}"
+                  elif (ins&0x7E000000)==0x36000000: # tbz w
+                      b5=(ins>>19)&0x1F; imm=sx(((ins>>5)&0x3FFF)|(((ins>>31)&1)<<14),15)*4; rt=ins&31; b=f"tbz w{rt},#{b5}, 0x{vm+imm:x}"
+                  elif (ins&0x7E000000)==0x37000000: # tbnz w
+                      b5=(ins>>19)&0x1F; imm=sx(((ins>>5)&0x3FFF)|(((ins>>31)&1)<<14),15)*4; rt=ins&31; b=f"tbnz w{rt},#{b5}, 0x{vm+imm:x}"
+                  elif (ins&0xFC000000)==0x14000000: # b
+                      imm=sx(ins&0x3FFFFFF,26)*4; b=f"b 0x{vm+imm:x}"
+                  if b: print(f"  0x{vm:x}:  {ins:08x}  {b}")
+                  j+=4
+          # also: objdump-friendly markers
+          print("\n### objdump windows (see log below) ###")
+          for acc in accs:
+              print(f"  objdump --start-address=0x{acc-0x300:x} --stop-address=0x{acc+0x100:x}")
+          PY
+          cat out/refs.txt
+        shell: bash
+      - name: objdump disasm windows
+        run: |
+          set +e
+          for acc in $(grep '^REF' out/refs.txt | sed 's/.*access=0x//'); do
+            start=$((0x$acc - 0x300)); stop=$((0x$acc + 0x100))
+            echo "================ WINDOW access=0x$acc (0x$start .. 0x$stop) ================"
+            objdump -d --start-address=0x$start --stop-address=0x$stop out/sbs.arm64e 2>/dev/null
+          done
+          echo "================ if no REF above, dump 0x345400..0x345800 (recharge candidate) ================"
+          objdump -d --start-address=0x345400 --stop-address=0x345800 out/sbs.arm64e 2>/dev/null
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: recharge_find, path: out/ }
