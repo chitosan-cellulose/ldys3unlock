@@ -1,0 +1,34 @@
+name: Patch SBS force-success (all 4 gates)
+
+on:
+  workflow_dispatch
+jobs:
+  patch:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ldid
+      - name: Assert + NOP all 4 gates (arm64e slice)
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          # arm64e FAT base = 0x6b8000 ; base-0 dylib so file = 0x6b8000 + VM
+          # NOP word = 1f 20 03 d5
+          # gate A: VM 0x3aa184 cbz x19 ->0x3aa3c8   fat 0xa62184  orig 33 12 00 b4
+          # gate B: VM 0x3aa188 cbz x20 ->0x3aa458   fat 0xa62188  orig 94 16 00 b4
+          # gate C: VM 0x3aa6e0 b.ne  ->0x3aaacc     fat 0xa626e0  orig 61 1f 00 54
+          # gate D: VM 0x3aa788 cbz w21->0x3aab5c    fat 0xa62788  orig b5 1e 00 34
+          for spec in "a62184:331200b4" "a62188:941600b4" "a626e0:611f0054" "a62788:b51e0034"; do
+            off="${spec%%:*}"; exp="${spec##*:}"
+            got=$(xxd -s 0x$off -l 4 -p $F)
+            echo "0x$off: got=$got expect=$exp"
+            test "$got" = "$exp" || { echo "ASSERT FAIL 0x$off"; exit 1; }
+            printf '\x1f\x20\x03\xd5' | dd of=$F bs=1 seek=$((0x$off)) conv=notrunc 2>/dev/null
+          done
+          echo "== verify all NOP =="
+          for off in a62184 a62188 a626e0 a62788; do echo -n "0x$off: "; xxd -s 0x$off -l 4 -p $F; done
+        shell: bash
+      - name: Re-sign
+        run: ldid -S bin/SpringBoardService.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: sbs_forced, path: bin/SpringBoardService.dylib }
