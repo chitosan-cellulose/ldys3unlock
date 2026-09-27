@@ -1,0 +1,25 @@
+name: Dump ObjC methods for toast imps
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: otool -ov method table, find names for imps 0x33f020/090/100
+        run: |
+          otool -ov out/sbs.arm64e > out/methods.txt 2>/dev/null
+          echo "###### method entries for imp 0x33f020 ######"
+          grep -n -B3 "imp 0x0*33f020" out/methods.txt | head -40
+          echo "###### method entries for imp 0x33f090 ######"
+          grep -n -B3 "imp 0x0*33f090" out/methods.txt | head -40
+          echo "###### method entries for imp 0x33f100 ######"
+          grep -n -B3 "imp 0x0*33f100" out/methods.txt | head -40
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate21, path: out/methods.txt }
