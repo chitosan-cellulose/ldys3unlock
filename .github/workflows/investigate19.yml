@@ -30,23 +30,25 @@ jobs:
                       f=struct.unpack_from("<I",d,so+48)[0]; sects[nm]=(a,s,f); so+=80
               off+=sz
           u32=lambda o: struct.unpack_from("<I",d,o)[0]
-          BASE=0x100000000                       # VM = fileoff + BASE for these slices
+          def vmof(fileoff):
+              for k,(a,s,f) in sects.items():
+                  if f<=fileoff<f+s: return a+(fileoff-f)
+              return fileoff
           targets=["无法获取用户状态。用户已过期或无法连接服务器","无法启动映射。因为用户已过期","未连接。可能用户已过期或其他错误"]
           t_a,t_sz,t_fo=sects["__text"]
-          tfo=t_fo; tsz=t_sz; ta=tfo+BASE        # __text VM base
-          print("__text foff=0x%x size=0x%x -> ta=0x%x"%(tfo,tsz,ta))
+          tfo=t_fo; tsz=t_sz; ta=t_a
+          print("__text foff=0x%x size=0x%x addr=0x%x"%(tfo,tsz,ta))
           out=open("out/xrefs.txt","w")
           for ts in targets:
               i=d.find(ts.encode("utf-16-le"))
               if i<0: i=d.find(ts.encode("utf-8"))
-              vm=i+BASE
+              vm=vmof(i)
               print("STR %r fileoff=0x%x VM=0x%x"%(ts[:12],i,vm))
-              # find cfstring struct whose strptr (chained-encoded) points to this string
               cf_vm=None
               for q in range(0,len(d)-8,8):
                   raw=struct.unpack_from("<Q",d,q)[0]
                   if (raw & 0xFFFFFFFFF)==vm:
-                      cf_vm=(q-16)+BASE; print("  cfstruct strptr@fileoff 0x%x -> cfstruct VM 0x%x"%(q,cf_vm)); break
+                      cf_vm=vmof(q-16); print("  cfstruct strptr@fo 0x%x -> cfstruct VM 0x%x"%(q,cf_vm)); break
               targets_vm=[vm]
               if cf_vm: targets_vm.append(cf_vm)
               hits=[]
@@ -72,7 +74,7 @@ jobs:
                           if (ins2&0xFFC00000)==0xF9400000 and (ins2&0x1F)==rt and ((ins2>>5)&0x1F)==rt:
                               imm12=(ins2>>10)&0xFFF
                               slot=(page+imm12*8)&0xFFFFFFFFFFFF
-                              fo=slot-BASE
+                              fo=slot
                               if 0<=fo<=len(d)-8:
                                   val=struct.unpack_from("<Q",d,fo)[0]
                                   if (val&0xFFFFFFFFF)==S: hits.append(("adrp+ldr",S,pc)); break
