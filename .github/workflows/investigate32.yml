@@ -1,0 +1,130 @@
+name: Find recharge branch via fixup decode
+
+on:
+  workflow_dispatch
+
+jobs:
+  find:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: thin arm64e
+        run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: decode cfstring ptrs (low36 mask) + find code refs
+        run: |
+          set +e
+          python3 - <<'PY' > out/r.txt 2>&1
+          import struct
+          d=open('out/sbs.arm64e','rb').read()
+          ncmds=struct.unpack_from('<I',d,16)[0]
+          off=32; sects={}
+          for _ in range(ncmds):
+              cmd,cs=struct.unpack_from('<II',d,off)
+              if cmd==0x19:
+                  ns=struct.unpack_from('<I',d,off+64)[0]; so=off+72
+                  for i in range(ns):
+                      sn=d[so:so+16].split(b'\0')[0].decode('latin1')
+                      sa,ss,so_=struct.unpack_from('<QQI',d,so+32)
+                      sects[sn]=(sa,ss,so_); so+=80
+              off+=cs
+          def u32(o): return struct.unpack_from('<I',d,o)[0]
+          def u64(o): return struct.unpack_from('<Q',d,o)[0]
+          MASK=(1<<36)-1
+          print("SECTIONS:", {k:(hex(v[0]),hex(v[1]),hex(v[2])) for k,v in sects.items()})
+          ca,cs,co=sects['__cfstring']
+          ua,us,uo=sects.get('__ustring',(0,0,0))
+          # map cfstring struct -> text VM via low36 mask of ptr (fixup-encoded)
+          cf_for_text={}      # textVM -> cfVM
+          text_for_cf={}      # cfVM -> textVM
+          for o in range(co,co+cs,0x20):
+              ptr_raw=u64(o+16)
+              tvm=ptr_raw & MASK
+              cfVM=ca+(o-co)
+              if ua and ua<=tvm<ua+us:
+                  cf_for_text[tvm]=cfVM; text_for_cf[cfVM]=tvm
+          print("resolved cfstring->text count:", len(text_for_cf))
+          targets_text=[0x581a00,0x58190e,0x5818ce,0x5818ec,0x581bde]
+          print("### target text -> cfstring ###")
+          cfs=[]
+          for t in targets_text:
+              cf=cf_for_text.get(t,0)
+              print(f"  text=0x{t:x} -> cf=0x{cf:x}")
+              if cf: cfs.append(cf)
+          # also: any cfstring whose decoded text, read as UTF-16, contains our chars
+          def utf16_at(vm,n=8):
+              o=uo+(vm-ua)
+              return d[o:o+n*2]
+          # verify by reading 充值失败 = U+5145 U+503C U+5931 U+8D25
+          want=[0x5145,0x503C,0x5931,0x8D25]
+          for t in targets_text:
+              o=uo+(t-ua)
+              chars=[struct.unpack_from('<H',d,o+2*k)[0] for k in range(4)]
+              print(f"  verify text@0x{t:x}: {[hex(c) for c in chars]}  match={'YES' if chars==want else 'no'}")
+          def sx(v,b):
+              if v&(1<<(b-1)): v-=(1<<b)
+              return v
+          ta,ts,to=sects['__text']; refs=[]
+          end=min(to+ts,len(d)); i=to
+          cfset=set(cfs)
+          while i+32<end:
+              vm=ta+(i-to); ins=u32(i)
+              if (ins&0x9F000000)==0x90000000:
+                  rd=ins&31; immlo=(ins>>29)&3; immhi=(ins>>5)&0x1FFFFF
+                  page=(vm&~0xFFF)+sx((immhi<<2)|immlo,21)*4096
+                  for k in range(1,7):
+                      i2=u32(i+4*k)
+                      if (i2&0xFFC00000)==0xF9400000 and ((i2>>5)&31)==rd:
+                          S=page+((i2>>10)&0xFFF)*8
+                          if S in cfset: refs.append((S,vm+4*k))
+                      if (i2&0x7F800000)==0x11000000 and ((i2>>5)&31)==rd:
+                          S=page+((i2>>10)&0xFFF)
+                          if S in cfset: refs.append((S,vm+4*k))
+              i+=4
+          print("\n### code refs (access VM loading target cfstring) ###")
+          seen=set(); accs=[]
+          for S,acc in refs:
+              if acc in seen: continue
+              seen.add(acc); accs.append(acc)
+              print(f"REF cf=0x{S:x} text=0x{text_for_cf.get(S,0):x} access=0x{acc:x}")
+          if not accs:
+              print("NO DIRECT REFS via adrp+add/ldr -> will dump candidate regions below")
+          # branches +/-0x300
+          print("\n### branches in window ###")
+          for acc in (accs if accs else [0x3455a8,0x3456d0,0x33f100]):
+              print(f"\n--- window for 0x{acc:x} ---")
+              j=max(to,acc-0x300); lim=acc+0x300
+              while j<lim:
+                  vm=ta+(j-to); ins=u32(j); b=None
+                  if (ins&0xFF000010)==0x54000000:
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; c=ins&0xF
+                      nm={0:'eq',1:'ne',2:'cs',3:'cc',4:'mi',5:'pl',6:'vs',7:'vc',8:'hi',9:'ls',10:'ge',11:'lt',12:'gt',13:'le'}.get(c,'?')
+                      b=f"b.{nm} 0x{vm+imm:x}"
+                  elif (ins&0x7E000000)==0x34000000:
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; b=f"cbz w{ins&31}, 0x{vm+imm:x}"
+                  elif (ins&0x7E000000)==0x35000000:
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; b=f"cbnz w{ins&31}, 0x{vm+imm:x}"
+                  elif (ins&0x7E000000)==0xB4000000:
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; b=f"cbz x{ins&31}, 0x{vm+imm:x}"
+                  elif (ins&0x7E000000)==0xB5000000:
+                      imm=sx((ins>>5)&0x7FFFF,19)*4; b=f"cbnz x{ins&31}, 0x{vm+imm:x}"
+                  elif (ins&0xFC000000)==0x14000000:
+                      imm=sx(ins&0x3FFFFFF,26)*4; b=f"b 0x{vm+imm:x}"
+                  if b: print(f"  0x{vm:x}: {ins:08x} {b}")
+                  j+=4
+          PY
+          cat out/r.txt
+        shell: bash
+      - name: objdump candidate windows
+        run: |
+          set +e
+          echo "===== 0x345400..0x345900 (recharge handler candidate) ====="
+          objdump -d --start-address=0x345400 --stop-address=0x345900 out/sbs.arm64e 2>/dev/null
+          echo "===== grep full disasm for recharge_fail cf load ====="
+          objdump -d out/sbs.arm64e > out/full.asm 2>/dev/null
+          grep -n "充值\|recharge\|3455a8\|3456d0\|581a00" out/full.asm | head -40 || true
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: recharge_find2, path: out/ }
