@@ -1,0 +1,20 @@
+name: Disasm request dispatch function
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: dump window
+        run: |
+          echo "###### 0x3aa080 - 0x3aa680 ######"
+          objdump -d --start-address=0x3aa080 --stop-address=0x3aa680 out/sbs.arm64e 2>/dev/null
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate27, path: out/ }
