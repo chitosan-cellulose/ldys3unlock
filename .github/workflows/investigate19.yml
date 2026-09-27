@@ -30,23 +30,33 @@ jobs:
                       f=struct.unpack_from("<I",d,so+48)[0]; sects[nm]=(a,s,f); so+=80
               off+=sz
           u32=lambda o: struct.unpack_from("<I",d,o)[0]
+          BASE=0x100000000                       # VM = fileoff + BASE for these slices
           targets=["无法获取用户状态。用户已过期或无法连接服务器","无法启动映射。因为用户已过期","未连接。可能用户已过期或其他错误"]
-          text=sects["__text"]; ta,tsz,tfo=text
+          t_a,t_sz,t_fo=sects["__text"]
+          tfo=t_fo; tsz=t_sz; ta=tfo+BASE        # __text VM base
+          print("__text foff=0x%x size=0x%x -> ta=0x%x"%(tfo,tsz,ta))
           out=open("out/xrefs.txt","w")
           for ts in targets:
               i=d.find(ts.encode("utf-16-le"))
               if i<0: i=d.find(ts.encode("utf-8"))
-              vm=None
-              for k,(a,s,f) in sects.items():
-                  if f<=i<f+s: vm=a+(i-f); break
+              vm=i+BASE
               print("STR %r fileoff=0x%x VM=0x%x"%(ts[:12],i,vm))
+              # find cfstring struct whose strptr (chained-encoded) points to this string
+              cf_vm=None
+              for q in range(0,len(d)-8,8):
+                  raw=struct.unpack_from("<Q",d,q)[0]
+                  if (raw & 0xFFFFFFFFF)==vm:
+                      cf_vm=(q-16)+BASE; print("  cfstruct strptr@fileoff 0x%x -> cfstruct VM 0x%x"%(q,cf_vm)); break
+              targets_vm=[vm]
+              if cf_vm: targets_vm.append(cf_vm)
               hits=[]
-              for o in range(tfo,tfo+tsz,4):
+              for S in targets_vm:
+                for o in range(tfo,tfo+tsz,4):
                   ins=u32(o); pc=ta+(o-tfo)
                   if (ins & 0x9F000000)==0x10000000:  # adr
                       immlo=(ins>>29)&3; immhi=(ins>>5)&0x7FFFF; imm=(immhi<<2)|immlo
                       if imm&(1<<20): imm-=(1<<21)
-                      if pc+imm==vm: hits.append(("adr",pc))
+                      if pc+imm==S: hits.append(("adr",S,pc))
                   if (ins & 0x9F000000)==0x90000000:  # adrp
                       immlo=(ins>>29)&3; immhi=(ins>>5)&0x7FFFF; imm=(immhi<<2)|immlo
                       if imm&(1<<20): imm-=(1<<21)
@@ -56,9 +66,9 @@ jobs:
                           ins2=u32(o+4*k)
                           if (ins2&0xFFC00000)==0x91000000 and (ins2&0x1F)==rt and ((ins2>>16)&0x1F)==rt:
                               lo12=(ins2>>10)&0xFFF; sh=(ins2>>22)&1
-                              if (page+(lo12<<(12 if sh else 0)))==vm: hits.append(("adrp",pc)); break
+                              if (page+(lo12<<(12 if sh else 0)))==S: hits.append(("adrp",S,pc)); break
               print("  xrefs:",hits)
-              for ty,pc in hits: out.write("%s\t0x%x\t0x%x\n"%(ts[:12],vm,pc))
+              for ty,tgt,pc in hits: out.write("%s\t0x%x\t0x%x\n"%(ts[:12],tgt,pc))
           out.close()
           print("done")
           PYEOF
