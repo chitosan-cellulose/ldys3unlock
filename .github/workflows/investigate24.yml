@@ -1,0 +1,57 @@
+name: Find request setup + block refs
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: locate URL string + request setup disasm
+        run: |
+          python3 - <<'PY'
+          import struct, subprocess
+          d=open('out/sbs.arm64e','rb').read(); n=len(d)
+          tfo=0x6848; tsz=0x493fa8; ta=0x6848
+          def u32(o): return struct.unpack_from('<I',d,o)[0]
+          def sx(v,b):
+              m=1<<(b-1); return v-(1<<b) if v&m else v
+          # find the URL c-string "http://api.jyyxt.vip"
+          needle=b'http://api.jyyxt.vip\x00'
+          pos=d.find(needle)
+          print(f"URL c-string at fileoff 0x{pos:x} (VM=0x{pos:x}, base0)")
+          # find a cfstring struct pointing to it: scan for fixup slot whose target==pos
+          cf=None
+          for o in range(0,n-7,8):
+              v=struct.unpack_from('<Q',d,o)[0]
+              if (v>>60) in (0x8,0x9,0xC,0xD,0x4,0x5,0x1) and (v&0xFFFFFFFFF)==pos:
+                  cf=o; break
+          print(f"cfstring struct slot at 0x{cf:x}" if cf else "cfstring struct not found")
+          # find code (adrp+add) referencing that cfstring address
+          refs=[]
+          if cf:
+            for o in range(tfo,tfo+tsz,4):
+                pc=ta+(o-tfo); ins=u32(o)
+                if (ins&0x9F000000)==0x90000000:
+                    rd=ins&0x1F
+                    imm=sx(((ins>>5)&0x7FFFF)<<2 | (ins>>29)&3,21)
+                    page=(pc&~0xFFF)+(imm<<12)
+                    for k in range(1,10):
+                        i2=u32(o+4*k)
+                        if (i2&0xFFC00000)==0x91000000 and ((i2>>5)&0x1F)==rd and page+((i2>>10)&0xFFF)==cf:
+                            refs.append(pc)
+          print(f"code refs to URL cfstring: {[hex(r) for r in refs]}")
+          # dump disasm around each ref (the request-setup function)
+          for r in refs:
+              s=max(0,r-0x180); e=r+0x280
+              out=subprocess.run(['objdump','-d',f'--start-address=0x{s:x}',f'--stop-address=0x{e:x}','out/sbs.arm64e'],capture_output=True,text=True).stdout
+              print(f"\n##### disasm around URL ref pc=0x{r:x} #####")
+              print(out)
+          PY
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate24, path: out/ }
