@@ -1,0 +1,61 @@
+name: Auth pointers + xrefs to toast blocks
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: decode all fixups + find code refs
+        run: |
+          python3 - <<'PY'
+          import struct
+          d=open('out/sbs.arm64e','rb').read()
+          n=len(d)
+          # chained fixup: high nibble of the 64-bit value selects type
+          # collect: slot file-offset -> target (low36), with auth flag
+          refs=[]
+          for o in range(0, n-7, 8):
+              v=struct.unpack_from('<Q',d,o)[0]
+              hi=v>>60
+              if hi in (0x8,0x9,0xC,0xD,0x4,0x5):   # rebase / auth rebase variants
+                  tgt=v & 0xFFFFFFFFF
+                  if 0x300000 <= tgt <= 0x4c0000:     # points into code
+                      refs.append((o,tgt,hi))
+          # show slots pointing to our toast functions & success area
+          interesting=(0x33f020,0x33f090,0x33f100,0x3aa66c)
+          print("=== fixup slots pointing into code (sample near toast/success) ===")
+          for o,tgt,hi in refs:
+              if tgt in interesting or 0x3aa600<=tgt<=0x3aac00 or 0x33f000<=tgt<=0x33f200:
+                  print(f"  slot_off=0x{o:x} -> tgt=0x{tgt:x} (hi={hi:x})")
+          # Now find __text adrp+add / adrp+ldr referencing those slot addresses (VM=off for base0)
+          tfo=0x6848; tsz=0x493fa8; ta=0x6848
+          slotvms=set(o for o,_,_ in refs)
+          def u32(o): return struct.unpack_from('<I',d,o)[0]
+          def sx(v,b):
+              m=1<<(b-1); return v-(1<<b) if v&m else v
+          print("=== code refs (adrp+add) to any fixup slot in this region ===")
+          cnt=0
+          for o in range(tfo,tfo+tsz,4):
+              pc=ta+(o-tfo); ins=u32(o)
+              if (ins&0x9F000000)==0x90000000:
+                  rd=ins&0x1F
+                  imm=sx(((ins>>5)&0x7FFFF)<<2 | (ins>>29)&3,21)
+                  page=(pc&~0xFFF)+(imm<<12)
+                  for k in range(1,10):
+                      i2=u32(o+4*k)
+                      if (i2&0xFFC00000)==0x91000000 and ((i2>>5)&0x1F)==rd:
+                          t=page+((i2>>10)&0xFFF)
+                          if t in slotvms:
+                              print(f"  load slot 0x{t:x} (-> check above) @ pc=0x{pc:x}"); cnt+=1
+          print(f"refs={cnt}")
+          print("=== done ===")
+          PY
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate23, path: out/ }
