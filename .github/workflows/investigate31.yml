@@ -13,7 +13,7 @@ jobs:
           mkdir -p out
           lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
         shell: bash
-      - name: python: map cfstrings, find refs, list branches in window
+      - name: 'map cfstrings -> find refs -> list branches'
         run: |
           set +e
           python3 - <<'PY' > out/refs.txt 2>&1
