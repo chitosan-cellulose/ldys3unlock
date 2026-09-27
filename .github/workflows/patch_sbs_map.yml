@@ -1,0 +1,30 @@
+name: Patch SBS mapping auth gate
+
+on:
+  workflow_dispatch:
+jobs:
+  patch:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ldid
+      - name: Assert + NOP both gates (arm64e slice)
+        run: |
+          set -e
+          F=bin/SpringBoardService.dylib
+          # arm64e slice base in FAT = 0x6b8000 ; file off = 0x6b8000 + VM
+          # gate1: VM 0x3aa6e0 -> file 0xa626e0 ; orig b.ne = 61 1f 00 54
+          # gate2: VM 0x3aa788 -> file 0xa62788 ; orig cbz w21 = b5 1e 00 34
+          echo "== assert gate1 =="; xxd -s 0xa626e0 -l 4 $F
+          test "$(xxd -s 0xa626e0 -l 4 -p $F)" = "611f0054"
+          echo "== assert gate2 =="; xxd -s 0xa62788 -l 4 $F
+          test "$(xxd -s 0xa62788 -l 4 -p $F)" = "b51e0034"
+          printf '\x1f\x20\x03\xd5' | dd of=$F bs=1 seek=$((0xa626e0)) conv=notrunc
+          printf '\x1f\x20\x03\xd5' | dd of=$F bs=1 seek=$((0xa62788)) conv=notrunc
+          echo "== verify gate1 =="; xxd -s 0xa626e0 -l 4 $F
+          echo "== verify gate2 =="; xxd -s 0xa62788 -l 4 $F
+        shell: bash
+      - name: Re-sign
+        run: ldid -S bin/SpringBoardService.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: sbs_patched, path: bin/SpringBoardService.dylib }
