@@ -1,0 +1,27 @@
+name: Pinpoint toast decision function
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+          objdump -d out/sbs.arm64e > out/full.asm 2>/dev/null
+        shell: bash
+      - name: find loads of toast block literals
+        run: |
+          for imm in eb0 ed0 ef0; do
+            echo "########## add #0x$imm (block literal) with -B45 ##########"
+            grep -nE "add	x[0-9]+, x[0-9]+, #0x$imm" out/full.asm | while read line; do
+              ln=$(echo "$line" | cut -d: -f1)
+              echo "----- match at asm line $ln -----"
+              sed -n "$((ln-45)),$((ln+2))p" out/full.asm
+            done
+          done
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: pinpoint, path: out/full.asm }
