@@ -1,0 +1,78 @@
+name: Xref status strings in SpringBoardService arm64e
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Thin arm64e
+        run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+          lipo -info out/sbs.arm64e
+        shell: bash
+      - name: Locate strings + find code xrefs
+        run: |
+          cat > xr.py <<'PYEOF'
+          import struct
+          d=open("out/sbs.arm64e","rb").read()
+          off=0x20; ncmds=struct.unpack_from("<I",d,16)[0]; sects={}
+          for _ in range(ncmds):
+              cmd,sz=struct.unpack_from("<II",d,off)
+              if cmd==0x19:
+                  n=struct.unpack_from("<I",d,off+64)[0]; so=off+72
+                  for _ in range(n):
+                      nm=d[so:so+16].split(b'\0')[0].decode()
+                      a=struct.unpack_from("<Q",d,so+32)[0]; s=struct.unpack_from("<Q",d,so+40)[0]
+                      f=struct.unpack_from("<I",d,so+48)[0]; sects[nm]=(a,s,f); so+=80
+              off+=sz
+          u32=lambda o: struct.unpack_from("<I",d,o)[0]
+          targets=["无法获取用户状态。用户已过期或无法连接服务器","无法启动映射。因为用户已过期","未连接。可能用户已过期或其他错误"]
+          text=sects["__text"]; ta,tsz,tfo=text
+          out=open("out/xrefs.txt","w")
+          for ts in targets:
+              i=d.find(ts.encode("utf-16-le"))
+              if i<0: i=d.find(ts.encode("utf-8"))
+              vm=None
+              for k,(a,s,f) in sects.items():
+                  if f<=i<f+s: vm=a+(i-f); break
+              print("STR %r fileoff=0x%x VM=0x%x"%(ts[:12],i,vm))
+              hits=[]
+              for o in range(tfo,tfo+tsz,4):
+                  ins=u32(o); pc=ta+(o-tfo)
+                  if (ins & 0x9F000000)==0x10000000:  # adr
+                      immlo=(ins>>29)&3; immhi=(ins>>5)&0x7FFFF; imm=(immhi<<2)|immlo
+                      if imm&(1<<20): imm-=(1<<21)
+                      if pc+imm==vm: hits.append(("adr",pc))
+                  if (ins & 0x9F000000)==0x90000000:  # adrp
+                      immlo=(ins>>29)&3; immhi=(ins>>5)&0x7FFFF; imm=(immhi<<2)|immlo
+                      if imm&(1<<20): imm-=(1<<21)
+                      page=((pc & ~0xFFF)+(imm<<12)) & 0xFFFFFFFFFFFF
+                      rt=ins&0x1F
+                      for k in range(1,7):
+                          ins2=u32(o+4*k)
+                          if (ins2&0xFFC00000)==0x91000000 and (ins2&0x1F)==rt and ((ins2>>16)&0x1F)==rt:
+                              lo12=(ins2>>10)&0xFFF; sh=(ins2>>22)&1
+                              if (page+(lo12<<(12 if sh else 0)))==vm: hits.append(("adrp",pc)); break
+              print("  xrefs:",hits)
+              for ty,pc in hits: out.write("%s\t0x%x\t0x%x\n"%(ts[:12],vm,pc))
+          out.close()
+          print("done")
+          PYEOF
+          python3 xr.py
+          echo "---- xrefs.txt ----"; cat out/xrefs.txt
+        shell: bash
+      - name: Disasm window around each xref
+        run: |
+          while IFS=$'\t' read -r name svm pc; do
+            [ -z "$pc" ] && continue
+            s=$((pc-0x60)); e=$((pc+0x80))
+            echo "############ $name  stringVM=$svm xref=$pc ############"
+            objdump -d --start-address=$(printf 0x%x $s) --stop-address=$(printf 0x%x $e) out/sbs.arm64e 2>/dev/null
+          done < out/xrefs.txt
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate19, path: out/ }
