@@ -1,0 +1,55 @@
+name: Find gate callers (python authoritative)
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+        shell: bash
+      - name: python search
+        run: |
+          python3 - <<'PY'
+          import struct
+          d=open('out/sbs.arm64e','rb').read()
+          # __text section: fileoff=0x6848, size=0x493fa8, addr=0x6848 (base0 dylib)
+          tfo=0x6848; tsz=0x493fa8; ta=0x6848
+          def u32(o): return struct.unpack_from('<I',d,o)[0]
+          def sx(v,b):
+              m=1<<(b-1)
+              return v-(1<<b) if v&m else v
+          targets={0x33f020:'toast_无法启动映射',0x33f090:'toast_未连接',0x33f100:'toast_无法获取用户状态',0x3aa66c:'success_handler?'}
+          print("=== direct bl/b/b.cond to target functions ===")
+          for o in range(tfo,tfo+tsz,4):
+              pc=ta+(o-tfo); ins=u32(o)
+              if (ins & 0xFC000000)==0x94000000:
+                  tgt=pc+sx(ins&0x3FFFFFF,26)*4
+                  if tgt in targets: print(f"  bl  pc=0x{pc:x} -> 0x{tgt:x} {targets[tgt]}")
+              if (ins & 0xFC000000)==0x14000000:
+                  tgt=pc+sx(ins&0x3FFFFFF,26)*4
+                  if tgt in targets: print(f"  b   pc=0x{pc:x} -> 0x{tgt:x} {targets[tgt]}")
+              if (ins & 0xFF000010)==0x54000000:
+                  tgt=pc+sx((ins>>5)&0x7FFFF,19)*4
+                  if tgt in targets: print(f"  b.cc pc=0x{pc:x} -> 0x{tgt:x} {targets[tgt]}")
+          print("=== adrp+add resolving to block literals 0x5adeb0/0x5aded0/0x5adef0 ===")
+          blk={0x5adeb0,0x5aded0,0x5adef0}
+          for o in range(tfo,tfo+tsz,4):
+              pc=ta+(o-tfo); ins=u32(o)
+              if (ins&0x9F000000)==0x90000000:
+                  rd=ins&0x1F
+                  imm=sx(((ins>>5)&0x7FFFF)<<2 | (ins>>29)&3,21)
+                  page=(pc&~0xFFF)+(imm<<12)
+                  for k in range(1,10):
+                      i2=u32(o+4*k)
+                      if (i2&0xFFC00000)==0x91000000 and ((i2>>5)&0x1F)==rd:
+                          t=page+((i2>>10)&0xFFF)
+                          if t in blk: print(f"  block 0x{t:x} loaded @ adrp pc=0x{pc:x}, add pc=0x{pc+4*k:x}")
+          print("=== done ===")
+          PY
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate22, path: out/ }
