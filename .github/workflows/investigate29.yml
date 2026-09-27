@@ -1,0 +1,41 @@
+name: Find real toast caller
+
+on:
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p out
+          lipo -thin arm64e bin/SpringBoardService.dylib -output out/sbs.arm64e 2>/dev/null || cp bin/SpringBoardService.dylib out/sbs.arm64e
+          objdump -d out/sbs.arm64e > out/full.asm 2>/dev/null
+        shell: bash
+      - name: A failure targets in 0x3aa66c
+        run: |
+          echo "###### 0x3aaacc - 0x3aab90 ######"
+          objdump -d --start-address=0x3aaacc --stop-address=0x3aab90 out/sbs.arm64e 2>/dev/null
+        shell: bash
+      - name: B refs to toast invoke funcs + block page
+        run: |
+          echo "###### grep 33f02 (toast invoke funcs) ######"
+          grep -nE "33f02[0-9a-f]|33f09[0-9a-f]|33f10[0-9a-f]" out/full.asm | head
+          echo "###### grep adrp page 0x5ad000 (toast block literals live here) ######"
+          grep -nE "0x5ad000" out/full.asm | head -40
+        shell: bash
+      - name: C raw pointer scan for block literal 0x5adef0 (LE f0 de 5a 00)
+        run: |
+          python3 - <<'PY'
+          d=open('out/sbs.arm64e','rb').read()
+          for tag,pat in [('blk_f0',bytes.fromhex('f0de5a0000000000')),('blk_d0',bytes.fromhex('d0de5a0000000000')),('blk_b0',bytes.fromhex('b0de5a0000000000')),('invoke_100',bytes.fromhex('00f1330000000000'))]:
+              offs=[];i=0
+              while True:
+                  j=d.find(pat,i)
+                  if j<0: break
+                  offs.append(j); i=j+1
+              print(tag, [hex(o) for o in offs[:20]], 'count', len(offs))
+          PY
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: investigate29, path: out/full.asm }
