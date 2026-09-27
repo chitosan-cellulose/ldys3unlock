@@ -62,11 +62,20 @@ jobs:
                       if imm&(1<<20): imm-=(1<<21)
                       page=((pc & ~0xFFF)+(imm<<12)) & 0xFFFFFFFFFFFF
                       rt=ins&0x1F
-                      for k in range(1,7):
+                      for k in range(1,8):
                           ins2=u32(o+4*k)
-                          if (ins2&0xFFC00000)==0x91000000 and (ins2&0x1F)==rt and ((ins2>>16)&0x1F)==rt:
+                          # adrp + add  -> direct address of S
+                          if (ins2&0xFFC00000)==0x91000000 and (ins2&0x1F)==rt and ((ins2>>5)&0x1F)==rt:
                               lo12=(ins2>>10)&0xFFF; sh=(ins2>>22)&1
-                              if (page+(lo12<<(12 if sh else 0)))==S: hits.append(("adrp",S,pc)); break
+                              if (page+(lo12<<(12 if sh else 0)))==S: hits.append(("adrp+add",S,pc)); break
+                          # adrp + ldr xT,[xT,#imm12]  -> load pointer from data slot; check slot contents
+                          if (ins2&0xFFC00000)==0xF9400000 and (ins2&0x1F)==rt and ((ins2>>5)&0x1F)==rt:
+                              imm12=(ins2>>10)&0xFFF
+                              slot=(page+imm12*8)&0xFFFFFFFFFFFF
+                              fo=slot-BASE
+                              if 0<=fo<=len(d)-8:
+                                  val=struct.unpack_from("<Q",d,fo)[0]
+                                  if (val&0xFFFFFFFFF)==S: hits.append(("adrp+ldr",S,pc)); break
               print("  xrefs:",hits)
               for ty,tgt,pc in hits: out.write("%s\t0x%x\t0x%x\n"%(ts[:12],tgt,pc))
           out.close()
